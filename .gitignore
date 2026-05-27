@@ -1,0 +1,16 @@
+.env
+.DS_Store
+.venv/
+.uv-cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+data/raw/*.csv
+data/state/*
+!.gitkeep
+.agent-notes/
+From AI Model to AI Agent - Assignment 3.pdf
