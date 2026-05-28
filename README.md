@@ -48,7 +48,7 @@ Run an interactive session:
 uv run python -m bitext_agent.cli --session demo --user-id demo
 ```
 
-The CLI prints route decisions, tool calls, observations, and final answers. Use `/exit` to distill profile memory for the conversation.
+The CLI prints route decisions, tool calls, observations, and final answers. Profile memory is distilled during normal graph execution by default; `/exit` also performs a final distillation pass.
 
 Try:
 
@@ -113,9 +113,11 @@ The graph contains these nodes:
 
 Dataset access uses Polars for dataframe operations and DuckDB for aggregation helpers. Tool specs are versioned Python modules under `src/bitext_agent/tool_specs/`; each module owns its metadata, Pydantic schemas, examples, return summary, and callable implementation.
 
-SQLite stores users, profile facts, prompt overrides, LLM usage logs, tool-call logs, cached recommendations, pending recommendations, full conversation turns, and cached session summaries. Full session logs remain stored for assignment compliance; summaries are additional compact context for long chats, not a replacement. A separate SQLite checkpoint database stores session state keyed by session ID and is also wired into LangGraph through `SqliteSaver`.
+SQLite stores users, profile facts, prompt overrides, LLM usage logs, tool-call logs, cached recommendations, pending recommendations, full conversation turns, and cached session summaries. Profile memory is distilled during graph execution by default every 3 user turns, with exact dedupe, canonical wording, and pruning to 30 active facts per user. Full session logs remain stored for assignment compliance; summaries are additional compact context for long chats, not a replacement. A separate SQLite checkpoint database stores session state keyed by session ID and is also wired into LangGraph through `SqliteSaver`.
 
 `user_id` and `session_id` are intentionally separate. The user profile stores durable facts for a person across chats, while a session stores one resumable conversation thread. The Streamlit UI lists saved sessions for the active user by reading persisted conversation turns.
+
+`MAX_AGENT_ITERATIONS` limits the number of ReAct model/tool cycles inside one user call and defaults to 10. `SESSION_RECENT_TURN_LIMIT` controls how many recent persisted conversation turns are included in each prompt and defaults to 6 to reduce token usage.
 
 ## Tests
 

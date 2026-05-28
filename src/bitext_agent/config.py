@@ -37,9 +37,9 @@ class Settings(BaseSettings):
     )
     app_db_path: Path = Field(default=Path("data/state/app.sqlite"), alias="APP_DB_PATH")
 
-    max_agent_iterations: int = Field(default=12, ge=1, le=50, alias="MAX_AGENT_ITERATIONS")
+    max_agent_iterations: int = Field(default=10, ge=1, le=50, alias="MAX_AGENT_ITERATIONS")
     memory_distillation_mode: MemoryMode = Field(
-        default="per_conversation", alias="MEMORY_DISTILLATION_MODE"
+        default="every_n_turns", alias="MEMORY_DISTILLATION_MODE"
     )
     memory_distillation_turn_interval: int = Field(
         default=3, ge=1, alias="MEMORY_DISTILLATION_TURN_INTERVAL"
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     session_compaction_turn_threshold: int = Field(
         default=16, ge=4, alias="SESSION_COMPACTION_TURN_THRESHOLD"
     )
-    session_recent_turn_limit: int = Field(default=12, ge=2, alias="SESSION_RECENT_TURN_LIMIT")
+    session_recent_turn_limit: int = Field(default=6, ge=2, alias="SESSION_RECENT_TURN_LIMIT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @computed_field

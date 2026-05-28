@@ -50,6 +50,7 @@ class SettingsStore:
                     user_uuid text not null,
                     kind text not null,
                     fact text not null,
+                    canonical_key text,
                     source text not null,
                     confidence real not null,
                     status text not null,
@@ -74,6 +75,7 @@ class SettingsStore:
                     latency_ms integer,
                     status text not null,
                     estimated_cost real,
+                    raw_usage_metadata_json text,
                     created_at text not null
                 );
                 create table if not exists cached_recommendations (
@@ -116,6 +118,14 @@ class SettingsStore:
                 );
                 """
             )
+            self._ensure_column(conn, "profile_facts", "canonical_key", "text")
+            self._ensure_column(conn, "llm_usage", "raw_usage_metadata_json", "text")
+            conn.execute(
+                """
+                create index if not exists idx_profile_facts_user_canonical
+                on profile_facts(user_uuid, canonical_key, status)
+                """
+            )
 
     def get_or_create_user(self, external_user_id: str | None) -> tuple[str, str]:
         """Resolve an external user ID to an internal UUID, creating it when needed."""
@@ -143,6 +153,7 @@ class SettingsStore:
         source: str,
         confidence: float = 0.5,
         status: str = "active",
+        canonical_key: str | None = None,
     ) -> int:
         """Add a distilled profile fact for a user."""
 
@@ -150,12 +161,93 @@ class SettingsStore:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
-                insert into profile_facts(user_uuid, kind, fact, source, confidence, status, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
+                insert into profile_facts(user_uuid, kind, fact, canonical_key, source, confidence,
+                status, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_uuid, kind, fact, source, confidence, status, now, now),
+                (user_uuid, kind, fact, canonical_key, source, confidence, status, now, now),
             )
             return int(cursor.lastrowid)
+
+    def upsert_profile_fact(
+        self,
+        user_uuid: str,
+        kind: str,
+        fact: str,
+        canonical_key: str,
+        source: str,
+        confidence: float = 0.75,
+    ) -> tuple[int, bool]:
+        """Create or refresh one active canonical profile fact."""
+
+        now = utc_now()
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                select id, confidence from profile_facts
+                where user_uuid = ? and canonical_key = ? and status = 'active'
+                order by confidence desc, updated_at desc, id desc
+                """,
+                (user_uuid, canonical_key),
+            ).fetchall()
+            if existing:
+                keeper = existing[0]
+                conn.execute(
+                    """
+                    update profile_facts
+                    set kind = ?, fact = ?, source = ?, confidence = max(confidence, ?), updated_at = ?
+                    where id = ?
+                    """,
+                    (kind, fact, source, confidence, now, int(keeper["id"])),
+                )
+                duplicate_ids = [int(row["id"]) for row in existing[1:]]
+                if duplicate_ids:
+                    placeholders = ",".join("?" for _ in duplicate_ids)
+                    conn.execute(
+                        f"""
+                        update profile_facts
+                        set status = 'duplicate', updated_at = ?
+                        where id in ({placeholders})
+                        """,
+                        (now, *duplicate_ids),
+                    )
+                return int(keeper["id"]), False
+
+            cursor = conn.execute(
+                """
+                insert into profile_facts(user_uuid, kind, fact, canonical_key, source, confidence,
+                status, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (user_uuid, kind, fact, canonical_key, source, confidence, now, now),
+            )
+            return int(cursor.lastrowid), True
+
+    def prune_profile_facts(self, user_uuid: str, max_active: int = 30) -> int:
+        """Soft-delete old, low-confidence facts beyond the active cap."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select id from profile_facts
+                where user_uuid = ? and status = 'active'
+                order by confidence desc, updated_at desc, id desc
+                """,
+                (user_uuid,),
+            ).fetchall()
+            stale_ids = [int(row["id"]) for row in rows[max_active:]]
+            if not stale_ids:
+                return 0
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"""
+                update profile_facts
+                set status = 'pruned', updated_at = ?
+                where id in ({placeholders})
+                """,
+                (utc_now(), *stale_ids),
+            )
+            return len(stale_ids)
 
     def list_profile_facts(self, user_uuid: str, include_inactive: bool = False) -> list[ProfileFact]:
         """Return profile facts for a user."""
@@ -217,6 +309,7 @@ class SettingsStore:
         total_tokens: int | None = None,
         latency_ms: int | None = None,
         estimated_cost: float | None = None,
+        raw_usage_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Write best-effort LLM usage metadata."""
 
@@ -224,8 +317,8 @@ class SettingsStore:
             conn.execute(
                 """
                 insert into llm_usage(session_id, user_uuid, model, prompt_tokens, completion_tokens,
-                total_tokens, latency_ms, status, estimated_cost, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                total_tokens, latency_ms, status, estimated_cost, raw_usage_metadata_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -237,6 +330,7 @@ class SettingsStore:
                     latency_ms,
                     status,
                     estimated_cost,
+                    json.dumps(raw_usage_metadata) if raw_usage_metadata else None,
                     utc_now(),
                 ),
             )
@@ -311,7 +405,7 @@ class SettingsStore:
             rows = conn.execute(
                 f"""
                 select session_id, model, status, prompt_tokens, completion_tokens,
-                       total_tokens, latency_ms, created_at
+                       total_tokens, latency_ms, raw_usage_metadata_json, created_at
                 from llm_usage
                 {where}
                 order by id desc
@@ -515,6 +609,18 @@ class SettingsStore:
             ).fetchone()
         return int(row["turns"])
 
+    def count_user_turns(self, session_id: str, user_uuid: str | None = None) -> int:
+        """Return the number of persisted user turns for a session."""
+
+        sql = "select count(*) turns from conversation_turns where session_id = ? and role = 'user'"
+        params: tuple[Any, ...] = (session_id,)
+        if user_uuid is not None:
+            sql += " and user_uuid = ?"
+            params = (session_id, user_uuid)
+        with self.connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["turns"])
+
     def get_session_summary(self, session_id: str) -> dict[str, Any] | None:
         """Return a cached compact summary for a session if one exists."""
 
@@ -558,12 +664,20 @@ class SettingsStore:
             params.append(user_uuid)
         return ("where " + " and ".join(clauses) if clauses else "", tuple(params))
 
+    def _ensure_column(
+        self, conn: sqlite3.Connection, table: str, column: str, declaration: str
+    ) -> None:
+        columns = {row["name"] for row in conn.execute(f"pragma table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"alter table {table} add column {column} {declaration}")
+
     def _fact_from_row(self, row: sqlite3.Row) -> ProfileFact:
         return ProfileFact(
             id=int(row["id"]),
             user_uuid=row["user_uuid"],
             kind=row["kind"],
             fact=row["fact"],
+            canonical_key=row["canonical_key"],
             source=row["source"],
             confidence=float(row["confidence"]),
             status=row["status"],

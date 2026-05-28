@@ -55,12 +55,12 @@ def invoke_with_usage_log(
             latency_ms=int((time.perf_counter() - start) * 1000),
         )
         raise
-    usage = getattr(result, "usage_metadata", None) or getattr(result, "response_metadata", {}).get(
-        "token_usage", {}
-    )
-    prompt_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
-    completion_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
-    total_tokens = usage.get("total_tokens")
+    usage = _extract_usage_metadata(result)
+    prompt_tokens = _int_or_none(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    completion_tokens = _int_or_none(usage.get("output_tokens") or usage.get("completion_tokens"))
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+    if total_tokens is None and (prompt_tokens is not None or completion_tokens is not None):
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
     store.log_usage(
         model=model_name,
         status="ok",
@@ -70,6 +70,47 @@ def invoke_with_usage_log(
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
         latency_ms=int((time.perf_counter() - start) * 1000),
+        raw_usage_metadata=usage or None,
     )
     return result
 
+
+def _extract_usage_metadata(result: Any) -> dict[str, Any]:
+    """Extract LangChain or OpenAI-compatible token usage metadata."""
+
+    candidates: list[Any] = [
+        getattr(result, "usage_metadata", None),
+        getattr(result, "response_metadata", None),
+    ]
+    if isinstance(result, dict):
+        candidates.extend([result.get("usage_metadata"), result.get("response_metadata"), result])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        data = _as_dict(candidate)
+        for key in ("token_usage", "usage"):
+            nested = _as_dict(data.get(key))
+            if nested:
+                return nested
+        if any(key in data for key in ("input_tokens", "prompt_tokens", "output_tokens", "completion_tokens", "total_tokens")):
+            return data
+    return {}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

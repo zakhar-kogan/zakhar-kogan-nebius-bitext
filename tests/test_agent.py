@@ -141,6 +141,60 @@ def test_recommendation_sets_pending_query(test_settings) -> None:
     assert service.store.get_pending_recommendation("rec") is not None
 
 
+def test_per_turn_memory_distillation_runs_during_graph(test_settings) -> None:
+    settings = test_settings.model_copy(update={"memory_distillation_mode": "per_turn"})
+    service = AgentService(
+        settings,
+        router=FakeRouter("structured", "profile update"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+
+    response = service.run_turn("My name is Alice and I prefer concise answers.", "mem", "demo")
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    facts = service.store.list_profile_facts(user_uuid)
+
+    assert any(fact.fact == "User's name is Alice" for fact in facts)
+    assert any(fact.kind == "format_preference" for fact in facts)
+    assert any(step.title == "Memory" for step in response.reasoning)
+
+
+def test_every_n_turns_memory_distillation_respects_interval(test_settings) -> None:
+    settings = test_settings.model_copy(
+        update={"memory_distillation_mode": "every_n_turns", "memory_distillation_turn_interval": 2}
+    )
+    service = AgentService(
+        settings,
+        router=FakeRouter("structured", "profile update"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+
+    service.run_turn("My name is Alice.", "mem-interval", "demo")
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    assert service.store.list_profile_facts(user_uuid) == []
+
+    service.run_turn("I prefer concise answers.", "mem-interval", "demo")
+    facts = service.store.list_profile_facts(user_uuid)
+
+    assert any("Alice" in fact.fact for fact in facts)
+    assert any(fact.kind == "format_preference" for fact in facts)
+
+
+def test_per_conversation_memory_distillation_preserves_manual_boundary(test_settings) -> None:
+    settings = test_settings.model_copy(update={"memory_distillation_mode": "per_conversation"})
+    service = AgentService(
+        settings,
+        router=FakeRouter("structured", "profile update"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+
+    service.run_turn("My name is Alice.", "mem-manual", "demo")
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    assert service.store.list_profile_facts(user_uuid) == []
+
+    service.distill_session("mem-manual", "demo")
+    assert any("Alice" in fact.fact for fact in service.store.list_profile_facts(user_uuid))
+
+
 def test_react_loop_executes_tool_and_final_answer(test_settings) -> None:
     service = AgentService(test_settings, router=FakeRouter("structured"))
     model = FakeChatModel(
@@ -158,6 +212,32 @@ def test_react_loop_executes_tool_and_final_answer(test_settings) -> None:
     assert response.answer == "REFUND: 2 rows."
     assert model.calls == 2
     assert any(step.title == "Tool call: count_rows" for step in response.reasoning)
+
+
+def test_profile_memory_question_can_use_profile_tool(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.upsert_profile_fact(
+        user_uuid,
+        "format_preference",
+        "User prefers concise answers",
+        "format_preference:concise-answers",
+        "test",
+    )
+    model = FakeChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "get_user_profile", "args": {"user_id": "current"}, "id": "p1"}],
+            ),
+            AIMessage(content="I remember that you prefer concise answers."),
+        ]
+    )
+
+    response = _runner(service, model).run("What do you remember about me?", "structured", {})
+
+    assert "concise" in response.answer
+    assert any(step.title == "Tool call: get_user_profile" for step in response.reasoning)
 
 
 def test_react_loop_executes_multiple_tool_calls(test_settings) -> None:
@@ -179,6 +259,27 @@ def test_react_loop_executes_multiple_tool_calls(test_settings) -> None:
 
     assert "REFUND has 2" in response.answer
     assert len([step for step in response.reasoning if step.title == "Tool call: count_rows"]) == 2
+
+
+def test_show_more_followup_uses_checkpoint_without_model_guessing(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    model = FakeChatModel([AIMessage(content="should not be used")])
+    checkpoint = {
+        "last_examples": {
+            "category": "REFUND",
+            "intent": None,
+            "search_id": None,
+            "n": 1,
+            "next_offset": 1,
+        }
+    }
+
+    response = _runner(service, model).run("Show me 1 more", "structured", checkpoint)
+
+    assert "more examples" in response.answer
+    assert checkpoint["last_examples"]["next_offset"] is None
+    assert model.calls == 0
+    assert any(step.title == "Tool call: show_examples" for step in response.reasoning)
 
 
 def test_max_iteration_fallback(test_settings) -> None:

@@ -15,7 +15,11 @@ from bitext_agent.config import Settings, get_settings
 from bitext_agent.data import DatasetRepository
 from bitext_agent.llm import configure_langsmith
 from bitext_agent.prompts import PromptStore
-from bitext_agent.memory import ConversationCheckpointStore, refresh_session_summary
+from bitext_agent.memory import (
+    ConversationCheckpointStore,
+    distill_profile_memory,
+    refresh_session_summary,
+)
 from bitext_agent.schemas import AgentResponse, ReasoningStep, RouteKind
 from bitext_agent.settings_store import SettingsStore
 from bitext_agent.tools import ToolRegistry
@@ -115,8 +119,6 @@ class AgentService:
     def distill_session(self, session_id: str, external_user_id: str | None) -> list[str]:
         """Distill profile memory for a session on user-controlled boundaries."""
 
-        from bitext_agent.memory import distill_profile_memory
-
         user_uuid, _ = self.store.get_or_create_user(external_user_id)
         return distill_profile_memory(self.store, session_id, user_uuid)
 
@@ -131,7 +133,7 @@ def build_graph(service: AgentService | None = None):
     builder.add_node("decline_out_of_scope", _decline_out_of_scope)
     builder.add_node("agent_runner", lambda state: _agent_runner(service, state))
     builder.add_node("query_recommendation", lambda state: _query_recommendation(service, state))
-    builder.add_node("memory_distillation", lambda state: state)
+    builder.add_node("memory_distillation", lambda state: _memory_distillation(service, state))
     builder.add_node("finalize", lambda state: _finalize(service, state))
     builder.set_entry_point("load_context")
     builder.add_edge("load_context", "route_query")
@@ -293,6 +295,30 @@ def _refine_recommendation(message: str, previous: str) -> str:
     if "distribution" in message:
         return "What is the distribution of intents in the REFUND category?"
     return previous
+
+
+def _memory_distillation(service: AgentService, state: GraphState) -> GraphState:
+    mode = service.settings.memory_distillation_mode
+    if mode == "per_conversation":
+        return state
+    if mode == "every_n_turns":
+        user_turns = service.store.count_user_turns(state["session_id"], state["user_uuid"])
+        if user_turns % service.settings.memory_distillation_turn_interval != 0:
+            return state
+
+    saved = distill_profile_memory(service.store, state["session_id"], state["user_uuid"])
+    if not saved:
+        return state
+    response = state.get("response")
+    if response:
+        response.reasoning.append(
+            ReasoningStep(
+                kind="memory",
+                title="Memory",
+                detail=f"Saved {len(saved)} profile fact(s).",
+            )
+        )
+    return state
 
 
 def _finalize(service: AgentService, state: GraphState) -> GraphState:

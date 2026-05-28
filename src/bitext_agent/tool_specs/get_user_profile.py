@@ -22,11 +22,13 @@ def build_spec(context: ToolRuntimeContext) -> ToolSpec:
     return ToolSpec(
         name="get_user_profile",
         version="1.0.0",
-        description="Read distilled profile facts for the current user.",
+        description=(
+            "Read distilled profile facts for the current user. Use this for explicit "
+            "profile-memory questions such as 'what do you remember about me'."
+        ),
         args_schema=GetUserProfileArgs,
         output_schema=ProfileResult,
         callable=get_user_profile,
         examples=[ToolExample(input={"user_id": "current"}, output_summary="Profile facts.")],
         return_summary="User UUID and active facts.",
     )
-

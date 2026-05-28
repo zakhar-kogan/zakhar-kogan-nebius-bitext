@@ -1,6 +1,6 @@
 """SQLite state and memory tests."""
 
-from bitext_agent.memory import distill_profile_memory, refresh_session_summary
+from bitext_agent.memory import canonical_profile_key, distill_profile_memory, refresh_session_summary
 from bitext_agent.settings_store import SettingsStore
 
 
@@ -19,6 +19,47 @@ def test_profile_fact_crud(tmp_path) -> None:
     assert len(store.list_profile_facts(user_uuid)) == 1
     store.delete_profile_fact(fact_id, user_uuid)
     assert store.list_profile_facts(user_uuid) == []
+
+
+def test_profile_fact_upsert_dedupes_by_canonical_key(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    key = canonical_profile_key("format_preference", "User prefers concise answers")
+
+    first_id, created_first = store.upsert_profile_fact(
+        user_uuid, "format_preference", "User prefers concise answers", key, "test", confidence=0.6
+    )
+    second_id, created_second = store.upsert_profile_fact(
+        user_uuid, "format_preference", "User prefers concise answers", key, "test", confidence=0.9
+    )
+
+    facts = store.list_profile_facts(user_uuid)
+    assert first_id == second_id
+    assert created_first is True
+    assert created_second is False
+    assert len(facts) == 1
+    assert facts[0].confidence == 0.9
+
+
+def test_profile_fact_pruning_keeps_newer_stronger_facts(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    for index in range(35):
+        store.upsert_profile_fact(
+            user_uuid,
+            "topic_interest",
+            f"User is interested in topic {index}",
+            f"topic_interest:topic-{index}",
+            "test",
+            confidence=0.1 + (index / 100),
+        )
+
+    pruned = store.prune_profile_facts(user_uuid, max_active=30)
+    facts = store.list_profile_facts(user_uuid)
+
+    assert pruned == 5
+    assert len(facts) == 30
+    assert all("topic 0" not in fact.fact for fact in facts)
 
 
 def test_prompt_override_resolution(tmp_path) -> None:
@@ -63,9 +104,12 @@ def test_session_and_tool_diagnostics(tmp_path) -> None:
 def test_distill_profile_memory(tmp_path) -> None:
     store = SettingsStore(tmp_path / "app.sqlite")
     user_uuid, _ = store.get_or_create_user("demo")
-    store.add_turn("s", user_uuid, "user", "I am interested in refund data")
+    store.add_turn("s", user_uuid, "user", "I am interested in refund data and prefer concise answers")
     saved = distill_profile_memory(store, "s", user_uuid)
     assert saved
+    kinds = {fact.kind for fact in store.list_profile_facts(user_uuid)}
+    assert "topic_interest" in kinds
+    assert "format_preference" in kinds
 
 
 def test_refresh_session_summary_preserves_full_turns(tmp_path) -> None:

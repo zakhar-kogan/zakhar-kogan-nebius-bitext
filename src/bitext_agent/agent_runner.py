@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
@@ -121,6 +122,10 @@ class LlmReActRunner(AgentRunner):
                 detail=f"Classified as {route}." + (f" {route_reason}" if route_reason else ""),
             )
         ]
+        show_more_response = self._try_show_more_followup(message, checkpoint, reasoning, route)
+        if show_more_response:
+            return show_more_response
+
         messages = self._initial_messages(message, route, checkpoint)
 
         for _ in range(self.settings.max_agent_iterations):
@@ -229,6 +234,56 @@ class LlmReActRunner(AgentRunner):
         reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=_summarize_result(payload)))
         return observation
 
+    def _try_show_more_followup(
+        self,
+        message: str,
+        checkpoint: dict[str, Any],
+        reasoning: list[ReasoningStep],
+        route: RouteKind,
+    ) -> AgentResponse | None:
+        previous = checkpoint.get("last_examples")
+        if not previous or not _is_show_more_request(message):
+            return None
+
+        n = _requested_more_count(message) or previous.get("n", 3)
+        args = {
+            "category": previous.get("category"),
+            "intent": previous.get("intent"),
+            "search_id": previous.get("search_id"),
+            "n": n,
+            "offset": previous.get("next_offset") or 0,
+        }
+        reasoning.append(ReasoningStep(kind="tool", title="Tool call: show_examples", detail=str(args)))
+        start = time.perf_counter()
+        try:
+            result = self.registry.call("show_examples", **args)
+        except Exception as exc:
+            self.store.log_tool_call(
+                session_id=self.registry.context.session_id,
+                user_uuid=self.registry.context.user_uuid,
+                tool_name="show_examples",
+                status="error",
+                latency_ms=int((time.perf_counter() - start) * 1000),
+                error=str(exc),
+            )
+            detail = f"Tool error: {exc}"
+            reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=detail))
+            return AgentResponse(answer=detail, route=route, reasoning=reasoning)
+
+        self.store.log_tool_call(
+            session_id=self.registry.context.session_id,
+            user_uuid=self.registry.context.user_uuid,
+            tool_name="show_examples",
+            status="ok",
+            latency_ms=int((time.perf_counter() - start) * 1000),
+        )
+        self._update_checkpoint("show_examples", args, result, checkpoint)
+        payload = result.model_dump(mode="json")
+        reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=_summarize_result(payload)))
+        answer = _format_examples(result.rows, result.offset, result.next_offset)
+        reasoning.append(ReasoningStep(kind="final", title="Final", detail=_shorten(answer)))
+        return AgentResponse(answer=answer, route=route, reasoning=reasoning)
+
     def _recent_turns_for_prompt(self, message: str) -> list[dict[str, Any]]:
         turns = self.registry.context.store.list_turns(
             self.registry.context.session_id,
@@ -276,6 +331,30 @@ def _message_text(message: AIMessage) -> str:
                 parts.append(item)
         return "\n".join(parts).strip()
     return str(content).strip()
+
+
+def _is_show_more_request(message: str) -> bool:
+    return bool(re.search(r"\b(show|give|list|display)?\s*(me\s*)?(\d+\s*)?more\b", message, re.I))
+
+
+def _requested_more_count(message: str) -> int | None:
+    match = re.search(r"\b(\d+)\s+more\b", message, re.I)
+    if not match:
+        return None
+    return max(1, min(int(match.group(1)), 25))
+
+
+def _format_examples(rows: list[Any], offset: int, next_offset: int | None) -> str:
+    if not rows:
+        return "There are no more examples for the previous request."
+    lines = [f"Here are {len(rows)} more examples starting at offset {offset}:", ""]
+    for row in rows:
+        lines.append(
+            f"- Row {row.row_id} ({row.category} / {row.intent}): {row.instruction} -> {row.response}"
+        )
+    if next_offset is None:
+        lines.append("\nNo further examples are available for that filter.")
+    return "\n".join(lines)
 
 
 def _summarize_result(payload: dict[str, Any]) -> str:

@@ -125,6 +125,7 @@ class ProfileFact(BaseModel):
     user_uuid: str
     kind: str
     fact: str
+    canonical_key: str | None = None
     source: str
     confidence: float = 0.5
     status: str = "active"
@@ -145,4 +146,3 @@ class RecommendationResult(BaseModel):
     query: str
     reason: str
     pending: bool = True
-
