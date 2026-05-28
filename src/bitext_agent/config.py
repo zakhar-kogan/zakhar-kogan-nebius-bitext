@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     router_model: str = Field(default="nvidia/Nemotron-3-Nano-Omni", alias="ROUTER_MODEL")
     main_model: str = Field(default="MiniMaxAI/MiniMax-M2.5-fast", alias="MAIN_MODEL")
     recommender_model: str = Field(default="", alias="RECOMMENDER_MODEL")
+    memory_dedupe_model: str = Field(default="", alias="MEMORY_DEDUPE_MODEL")
 
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
     langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
@@ -56,6 +57,13 @@ class Settings(BaseSettings):
         """Return the configured recommender model, falling back to the router model."""
 
         return self.recommender_model or self.router_model
+
+    @computed_field
+    @property
+    def active_memory_dedupe_model(self) -> str:
+        """Return the configured memory dedupe model, falling back to the recommender model."""
+
+        return self.memory_dedupe_model or self.active_recommender_model
 
 
 def get_settings() -> Settings:

@@ -27,7 +27,12 @@ def build_spec(context: ToolRuntimeContext) -> ToolSpec:
         offset: int = 0,
     ) -> ExamplesResult:
         rows, next_offset, total = context.repository.show_examples(category, intent, search_id, n, offset)
-        return ExamplesResult(rows=rows, offset=offset, next_offset=next_offset, total_matches=total)
+        return ExamplesResult(
+            rows=[row.model_dump(mode="json") for row in rows],
+            offset=offset,
+            next_offset=next_offset,
+            total_matches=total,
+        )
 
     return ToolSpec(
         name="show_examples",
@@ -39,4 +44,3 @@ def build_spec(context: ToolRuntimeContext) -> ToolSpec:
         examples=[ToolExample(input={"category": "SHIPPING", "n": 3}, output_summary="3 examples.")],
         return_summary="Example rows and next offset.",
     )
-

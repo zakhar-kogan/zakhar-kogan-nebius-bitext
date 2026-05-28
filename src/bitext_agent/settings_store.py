@@ -223,6 +223,57 @@ class SettingsStore:
             )
             return int(cursor.lastrowid), True
 
+    def update_profile_fact(
+        self,
+        fact_id: int,
+        kind: str,
+        fact: str,
+        canonical_key: str,
+        source: str,
+        confidence: float,
+    ) -> None:
+        """Replace one active profile fact with a stronger equivalent fact."""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update profile_facts
+                set kind = ?, fact = ?, canonical_key = ?, source = ?, confidence = ?, updated_at = ?
+                where id = ? and status = 'active'
+                """,
+                (kind, fact, canonical_key, source, confidence, utc_now(), fact_id),
+            )
+
+    def update_profile_fact_canonical_key(self, fact_id: int, canonical_key: str) -> None:
+        """Backfill a missing or stale canonical key for one profile fact."""
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update profile_facts
+                set canonical_key = ?, updated_at = ?
+                where id = ?
+                """,
+                (canonical_key, utc_now(), fact_id),
+            )
+
+    def mark_profile_facts_duplicate(self, fact_ids: list[int]) -> int:
+        """Soft-mark profile facts as duplicates."""
+
+        if not fact_ids:
+            return 0
+        placeholders = ",".join("?" for _ in fact_ids)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                update profile_facts
+                set status = 'duplicate', updated_at = ?
+                where id in ({placeholders})
+                """,
+                (utc_now(), *fact_ids),
+            )
+            return int(cursor.rowcount)
+
     def prune_profile_facts(self, user_uuid: str, max_active: int = 30) -> int:
         """Soft-delete old, low-confidence facts beyond the active cap."""
 

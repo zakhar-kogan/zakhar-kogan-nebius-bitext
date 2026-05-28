@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+from collections.abc import Callable, Iterator
 from typing import Any, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -20,7 +21,7 @@ from bitext_agent.memory import (
     distill_profile_memory,
     refresh_session_summary,
 )
-from bitext_agent.schemas import AgentResponse, ReasoningStep, RouteKind
+from bitext_agent.schemas import AgentEvent, AgentResponse, ReasoningStep, RouteKind
 from bitext_agent.settings_store import SettingsStore
 from bitext_agent.tools import ToolRegistry
 
@@ -95,6 +96,88 @@ class AgentService:
         )
         return response
 
+    def stream_turn(
+        self,
+        message: str,
+        session_id: str,
+        external_user_id: str | None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Run one conversation turn and yield progress events."""
+
+        user_uuid, resolved_user_id = self.store.get_or_create_user(external_user_id)
+        _ = resolved_user_id
+        self.store.add_turn(session_id, user_uuid, "user", message)
+        refresh_session_summary(
+            self.store,
+            session_id,
+            user_uuid,
+            compact_after_turns=self.settings.session_compaction_turn_threshold,
+            keep_recent_turns=self.settings.session_recent_turn_limit,
+        )
+        state: GraphState = {"message": message, "session_id": session_id, "user_uuid": user_uuid}
+        final_response: AgentResponse | None = None
+        cancel_check = cancel_check or (lambda: False)
+
+        try:
+            state = _load_context(self, state)
+            if cancel_check():
+                final_response = _cancelled_response("structured", [])
+                yield AgentEvent(kind="cancelled", title="Stopped", detail=final_response.answer, final_response=final_response)
+                return
+            state = _route_query(self, state)
+            route_step = ReasoningStep(
+                kind="route",
+                title="Router",
+                detail=f"Classified as {state['route']}. {state.get('route_reason', '')}".strip(),
+            )
+            if cancel_check():
+                final_response = _cancelled_response(state["route"], [route_step])
+                yield AgentEvent(kind="cancelled", title="Stopped", detail=final_response.answer, final_response=final_response)
+                return
+
+            if state["route"] == "out_of_scope":
+                state = _decline_out_of_scope(state)
+                final_response = state["response"]
+                yield AgentEvent(kind="route", title=route_step.title, detail=route_step.detail)
+                yield AgentEvent(kind="final", title="Final", detail=final_response.answer, answer_delta=final_response.answer, final_response=final_response)
+            elif state["route"] == "recommendation":
+                state = _query_recommendation(self, state)
+                final_response = state["response"]
+                for step in final_response.reasoning:
+                    yield AgentEvent(kind=step.kind, title=step.title, detail=step.detail)
+                yield AgentEvent(kind="final", title="Final", detail=final_response.answer, answer_delta=final_response.answer, final_response=final_response)
+            else:
+                async_state = _agent_runner_stream(self, state, cancel_check)
+                for event in async_state:
+                    if event.final_response:
+                        final_response = event.final_response
+                    yield event
+                state["response"] = final_response or _cancelled_response(state["route"], [])
+
+            state = _memory_distillation(self, state)
+            if final_response and state.get("response") is final_response:
+                memory_steps = [step for step in final_response.reasoning if step.kind == "memory"]
+                for step in memory_steps[-1:]:
+                    yield AgentEvent(kind="memory", title=step.title, detail=step.detail)
+            _finalize(self, state)
+        finally:
+            if final_response is not None:
+                self.store.add_turn(
+                    session_id,
+                    user_uuid,
+                    "assistant",
+                    final_response.answer,
+                    {"route": final_response.route, "suggested_query": final_response.suggested_query},
+                )
+                refresh_session_summary(
+                    self.store,
+                    session_id,
+                    user_uuid,
+                    compact_after_turns=self.settings.session_compaction_turn_threshold,
+                    keep_recent_turns=self.settings.session_recent_turn_limit,
+                )
+
     def starter_recommendations(self) -> list[str]:
         """Return cached starter questions based on dataset shape."""
 
@@ -116,11 +199,25 @@ class AgentService:
         self.store.set_cached_recommendations(cache_key, recommendations)
         return recommendations
 
+    def recommend_queries(
+        self, session_id: str, external_user_id: str | None, limit: int = 2
+    ) -> list[str]:
+        """Return starter or profile-aware query recommendations for UI buttons."""
+
+        user_uuid, _ = self.store.get_or_create_user(external_user_id)
+        facts = self.store.list_profile_facts(user_uuid)
+        recent_text = " ".join(
+            turn["content"].lower() for turn in self.store.list_turns(session_id, limit=8)
+        )
+        candidates = _profile_recommendations([fact.fact for fact in facts]) if facts else []
+        candidates = _recent_recommendations(recent_text) + candidates
+        return _dedupe(candidates + self.starter_recommendations())[:limit]
+
     def distill_session(self, session_id: str, external_user_id: str | None) -> list[str]:
         """Distill profile memory for a session on user-controlled boundaries."""
 
         user_uuid, _ = self.store.get_or_create_user(external_user_id)
-        return distill_profile_memory(self.store, session_id, user_uuid)
+        return distill_profile_memory(self.store, session_id, user_uuid, settings=self.settings)
 
 
 def build_graph(service: AgentService | None = None):
@@ -216,6 +313,35 @@ def _agent_runner(service: AgentService, state: GraphState) -> GraphState:
     return {**state, "response": response}
 
 
+def _agent_runner_stream(
+    service: AgentService, state: GraphState, cancel_check: Callable[[], bool]
+) -> Iterator[AgentEvent]:
+    registry = ToolRegistry(
+        repository=service.repository,
+        store=service.store,
+        session_id=state["session_id"],
+        user_uuid=state["user_uuid"],
+    )
+    if service.runner_factory:
+        runner: AgentRunner = service.runner_factory(registry, service, state)
+        response = runner.run(
+            state["message"], state["route"], state["checkpoint"], state.get("route_reason", "")
+        )
+        for step in response.reasoning:
+            yield AgentEvent(kind=step.kind, title=step.title, detail=step.detail)
+        yield AgentEvent(kind="final", title="Final", detail=response.answer, answer_delta=response.answer, final_response=response)
+        return
+    runner = LlmReActRunner(
+        registry=registry,
+        settings=service.settings,
+        store=service.store,
+        prompt_store=service.prompt_store,
+    )
+    yield from runner.stream(
+        state["message"], state["route"], state["checkpoint"], state.get("route_reason", ""), cancel_check
+    )
+
+
 def _query_recommendation(service: AgentService, state: GraphState) -> GraphState:
     registry = ToolRegistry(
         repository=service.repository,
@@ -306,7 +432,12 @@ def _memory_distillation(service: AgentService, state: GraphState) -> GraphState
         if user_turns % service.settings.memory_distillation_turn_interval != 0:
             return state
 
-    saved = distill_profile_memory(service.store, state["session_id"], state["user_uuid"])
+    saved = distill_profile_memory(
+        service.store,
+        state["session_id"],
+        state["user_uuid"],
+        settings=service.settings,
+    )
     if not saved:
         return state
     response = state.get("response")
@@ -324,6 +455,60 @@ def _memory_distillation(service: AgentService, state: GraphState) -> GraphState
 def _finalize(service: AgentService, state: GraphState) -> GraphState:
     service.checkpoints.save(state["session_id"], state.get("checkpoint", {}))
     return state
+
+
+def _profile_recommendations(facts: list[str]) -> list[str]:
+    text = " ".join(facts).lower()
+    recommendations: list[str] = []
+    if any(term in text for term in ["refund", "money back", "billing"]):
+        recommendations.extend([
+            "Show me 5 examples from the REFUND category.",
+            "What is the distribution of intents in the REFUND category?",
+        ])
+    if any(term in text for term in ["complaint", "angry", "frustrated", "escalation"]):
+        recommendations.extend([
+            "Summarize how agents respond to complaint intents.",
+            "Show me 5 examples from the FEEDBACK category.",
+        ])
+    if "concise" in text or "brief" in text:
+        recommendations.append("What categories exist in the dataset?")
+    if "example" in text:
+        recommendations.append("Show me 5 examples from the dataset.")
+    if "count" in text or "number" in text:
+        recommendations.append("How many refund requests did we get?")
+    return recommendations or [
+        "What categories exist in the dataset?",
+        "Summarize how agents respond to complaint intents.",
+    ]
+
+
+def _recent_recommendations(recent_text: str) -> list[str]:
+    recommendations: list[str] = []
+    if "refund" in recent_text or "money back" in recent_text:
+        recommendations.append("Show me 5 examples from the REFUND category.")
+    if "complaint" in recent_text:
+        recommendations.append("Summarize how agents respond to complaint intents.")
+    return recommendations
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def _cancelled_response(route: RouteKind, reasoning: list[ReasoningStep]) -> AgentResponse:
+    answer = "Stopped before completion."
+    return AgentResponse(
+        answer=answer,
+        route=route,
+        reasoning=[*reasoning, ReasoningStep(kind="cancelled", title="Stopped", detail=answer)],
+    )
 
 
 graph = build_graph()

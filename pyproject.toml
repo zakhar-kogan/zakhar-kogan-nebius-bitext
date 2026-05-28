@@ -28,6 +28,8 @@ dev = [
 
 [project.scripts]
 bitext-agent = "bitext_agent.cli:main"
+bitext-start = "bitext_agent.start:main"
+start = "bitext_agent.start:main"
 
 [build-system]
 requires = ["hatchling"]

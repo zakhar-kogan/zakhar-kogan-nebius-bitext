@@ -31,6 +31,7 @@ def build_chat_model(settings: Settings, model_name: str, temperature: float = 0
         api_key=settings.nebius_api_key,
         base_url=settings.nebius_base_url,
         temperature=temperature,
+        stream_usage=True,
     )
 
 
@@ -81,19 +82,40 @@ def _extract_usage_metadata(result: Any) -> dict[str, Any]:
     candidates: list[Any] = [
         getattr(result, "usage_metadata", None),
         getattr(result, "response_metadata", None),
+        getattr(result, "additional_kwargs", None),
     ]
     if isinstance(result, dict):
-        candidates.extend([result.get("usage_metadata"), result.get("response_metadata"), result])
+        candidates.extend([
+            result.get("usage_metadata"),
+            result.get("response_metadata"),
+            result.get("additional_kwargs"),
+            result,
+        ])
     for candidate in candidates:
         if not candidate:
             continue
-        data = _as_dict(candidate)
-        for key in ("token_usage", "usage"):
-            nested = _as_dict(data.get(key))
-            if nested:
-                return nested
-        if any(key in data for key in ("input_tokens", "prompt_tokens", "output_tokens", "completion_tokens", "total_tokens")):
-            return data
+        usage = _find_usage(_as_dict(candidate))
+        if usage:
+            return usage
+    return {}
+
+
+def _find_usage(data: dict[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    if any(
+        key in data
+        for key in ("input_tokens", "prompt_tokens", "output_tokens", "completion_tokens", "total_tokens")
+    ):
+        return data
+    for key in ("token_usage", "usage", "usage_metadata"):
+        nested = _find_usage(_as_dict(data.get(key)))
+        if nested:
+            return nested
+    for choice in data.get("choices") or []:
+        nested = _find_usage(_as_dict(choice))
+        if nested:
+            return nested
     return {}
 
 

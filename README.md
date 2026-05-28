@@ -78,6 +78,25 @@ uv run fastmcp run src/bitext_agent/mcp_server.py:mcp
 
 Exposed tools include `list_categories`, `count_rows`, `show_examples`, and `intent_distribution`.
 
+## One-command local start
+
+Start both the Streamlit UI and an HTTP FastMCP server:
+
+```bash
+uv run start
+```
+
+Useful options:
+
+```bash
+uv run start --no-mcp
+uv run start --no-streamlit
+uv run start --streamlit-port 8600 --mcp-port 9000
+uv run start --mcp-transport sse --mcp-path /sse/
+```
+
+By default, Streamlit binds to `127.0.0.1:8501`, and MCP binds to `127.0.0.1:8000` using HTTP transport. `uv` does not support project-defined top-level commands like `uv start`, so the local project command is `uv run start`.
+
 Minimal Python client shape:
 
 ```python

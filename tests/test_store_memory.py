@@ -1,6 +1,11 @@
 """SQLite state and memory tests."""
 
-from bitext_agent.memory import canonical_profile_key, distill_profile_memory, refresh_session_summary
+from bitext_agent.memory import (
+    cleanup_profile_memory,
+    canonical_profile_key,
+    distill_profile_memory,
+    refresh_session_summary,
+)
 from bitext_agent.settings_store import SettingsStore
 
 
@@ -110,6 +115,142 @@ def test_distill_profile_memory(tmp_path) -> None:
     kinds = {fact.kind for fact in store.list_profile_facts(user_uuid)}
     assert "topic_interest" in kinds
     assert "format_preference" in kinds
+
+
+def test_distill_profile_memory_fuzzy_auto_merges_near_duplicates(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    store.add_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User often explores refund related support data",
+        "test",
+        confidence=0.5,
+        canonical_key="topic_interest:refund related",
+    )
+    store.add_turn("s", user_uuid, "user", "Can you show me refund examples?")
+
+    saved = distill_profile_memory(store, "s", user_uuid)
+    facts = store.list_profile_facts(user_uuid)
+
+    assert saved == []
+    assert len(facts) == 1
+    assert facts[0].fact == "User often explores refund-related support data"
+    assert facts[0].confidence == 0.75
+
+
+def test_distill_profile_memory_gray_band_merges_when_reviewer_confirms(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    store.add_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User likes refund-related support data",
+        "test",
+        confidence=0.5,
+        canonical_key="topic_interest:likes refund related",
+    )
+    store.add_turn("s", user_uuid, "user", "Can you show me refund examples?")
+    calls: list[tuple[str, str]] = []
+
+    saved = distill_profile_memory(
+        store,
+        "s",
+        user_uuid,
+        dedupe_reviewer=lambda candidate, existing: calls.append((candidate, existing)) or True,
+    )
+    facts = store.list_profile_facts(user_uuid)
+
+    assert saved == []
+    assert len(calls) == 1
+    assert len(facts) == 1
+    assert facts[0].fact == "User often explores refund-related support data"
+
+
+def test_distill_profile_memory_gray_band_failure_keeps_candidate(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    store.add_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User likes refund-related support data",
+        "test",
+        confidence=0.5,
+        canonical_key="topic_interest:likes refund related",
+    )
+    store.add_turn("s", user_uuid, "user", "Can you show me refund examples?")
+
+    def failing_reviewer(candidate: str, existing: str) -> bool | None:
+        raise RuntimeError("model unavailable")
+
+    saved = distill_profile_memory(store, "s", user_uuid, dedupe_reviewer=failing_reviewer)
+    facts = store.list_profile_facts(user_uuid)
+
+    assert saved == ["User often explores refund-related support data"]
+    assert len(facts) == 2
+
+
+def test_distill_profile_memory_fuzzy_dedupe_is_same_kind_only(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    store.add_profile_fact(
+        user_uuid,
+        "workflow_pattern",
+        "User often explores refund related support data",
+        "test",
+        confidence=0.9,
+        canonical_key="workflow_pattern:refund related",
+    )
+    store.add_turn("s", user_uuid, "user", "Can you show me refund examples?")
+
+    saved = distill_profile_memory(store, "s", user_uuid)
+    facts = store.list_profile_facts(user_uuid)
+
+    assert saved == ["User often explores refund-related support data"]
+    assert len(facts) == 2
+    assert {fact.kind for fact in facts} == {"workflow_pattern", "topic_interest"}
+
+
+def test_distill_profile_memory_keeps_higher_confidence_duplicate(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    store.add_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User often explores refund related support data",
+        "test",
+        confidence=0.95,
+        canonical_key="topic_interest:refund related",
+    )
+    store.add_turn("s", user_uuid, "user", "Can you show me refund examples?")
+
+    saved = distill_profile_memory(store, "s", user_uuid)
+    facts = store.list_profile_facts(user_uuid)
+
+    assert saved == []
+    assert len(facts) == 1
+    assert facts[0].fact == "User often explores refund related support data"
+    assert facts[0].confidence == 0.95
+
+
+def test_cleanup_profile_memory_backfills_and_collapses_exact_duplicates(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "app.sqlite")
+    user_uuid, _ = store.get_or_create_user("demo")
+    fact = "User often explores refund-related support data"
+    key = canonical_profile_key("topic_interest", fact)
+    store.add_profile_fact(user_uuid, "topic_interest", fact, "old", confidence=0.5)
+    store.add_profile_fact(
+        user_uuid, "topic_interest", fact, "new", confidence=0.8, canonical_key=key
+    )
+
+    changed = cleanup_profile_memory(store, user_uuid)
+    active = store.list_profile_facts(user_uuid)
+    all_facts = store.list_profile_facts(user_uuid, include_inactive=True)
+
+    assert changed == 2
+    assert len(active) == 1
+    assert active[0].confidence == 0.8
+    assert sum(fact.status == "duplicate" for fact in all_facts) == 1
 
 
 def test_refresh_session_summary_preserves_full_turns(tmp_path) -> None:

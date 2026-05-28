@@ -141,6 +141,106 @@ def test_recommendation_sets_pending_query(test_settings) -> None:
     assert service.store.get_pending_recommendation("rec") is not None
 
 
+def test_confirmed_recommendation_clears_pending_query(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "confirmed"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-confirm", user_uuid, "How many refund requests did we get?", "test"
+    )
+
+    response = service.run_turn("yes", "rec-confirm", "demo")
+
+    assert response.route == "structured"
+    assert service.store.get_pending_recommendation("rec-confirm") is None
+
+
+def test_recommend_queries_refresh_after_recommendation_answer(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("structured"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+
+    before = service.recommend_queries("rec-refresh", "demo", limit=2)
+    service.run_turn("How many refund requests did we get?", "rec-refresh", "demo")
+    after = service.recommend_queries("rec-refresh", "demo", limit=2)
+
+    assert before != after
+    assert after[0] == "Show me 5 examples from the REFUND category."
+
+
+def test_recommend_queries_uses_starters_without_profile(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+
+    recommendations = service.recommend_queries("rec-ui", "demo", limit=2)
+
+    assert recommendations == service.starter_recommendations()[:2]
+
+
+def test_recommend_queries_uses_profile_facts(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.upsert_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User is interested in refund data",
+        "topic_interest:refund",
+        "test",
+    )
+
+    recommendations = service.recommend_queries("rec-ui-profile", "demo", limit=2)
+
+    assert "REFUND" in " ".join(recommendations)
+
+
+def test_stream_turn_emits_tool_events_and_final_response(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("structured"),
+        runner_factory=lambda registry, service, state: LlmReActRunner(
+            registry=registry,
+            settings=service.settings,
+            store=service.store,
+            prompt_store=PromptStore(service.store),
+            model=FakeChatModel(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "count_rows", "args": {"category": "REFUND"}, "id": "t1"}],
+                    ),
+                    AIMessage(content="REFUND: 2 rows."),
+                ]
+            ),
+        ),
+    )
+
+    events = list(service.stream_turn("How many refund requests did we get?", "stream", "demo"))
+
+    assert any(event.title == "Tool call: count_rows" for event in events)
+    assert events[-1].final_response is not None
+    assert events[-1].final_response.answer == "REFUND: 2 rows."
+
+
+def test_stream_turn_can_cancel_before_runner(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured", "dataset count"))
+    calls = 0
+
+    def cancel_after_route() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 2
+
+    events = list(service.stream_turn("How many refund requests did we get?", "cancel", "demo", cancel_after_route))
+
+    assert events[-1].kind == "cancelled"
+    assert events[-1].final_response is not None
+    assert events[-1].final_response.answer == "Stopped before completion."
+
+
 def test_per_turn_memory_distillation_runs_during_graph(test_settings) -> None:
     settings = test_settings.model_copy(update={"memory_distillation_mode": "per_turn"})
     service = AgentService(

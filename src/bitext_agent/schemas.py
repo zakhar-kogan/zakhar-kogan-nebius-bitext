@@ -29,6 +29,19 @@ class AgentResponse(BaseModel):
     suggested_query: str | None = None
 
 
+AgentEventKind = Literal["route", "tool", "observation", "final", "fallback", "memory", "cancelled", "error"]
+
+
+class AgentEvent(BaseModel):
+    """Incremental user-visible event emitted while a turn is running."""
+
+    kind: AgentEventKind
+    title: str
+    detail: str = ""
+    answer_delta: str = ""
+    final_response: AgentResponse | None = None
+
+
 class RouterDecision(BaseModel):
     """Router output before the agent chooses tools."""
 

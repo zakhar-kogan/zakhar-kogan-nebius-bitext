@@ -27,7 +27,11 @@ def build_spec(context: ToolRuntimeContext) -> ToolSpec:
         limit: int = 20,
     ) -> SearchRowsResult:
         search_id, total, rows = context.repository.search_rows(category, intent, query, fuzzy, limit)
-        return SearchRowsResult(search_id=search_id, total_matches=total, rows=rows)
+        return SearchRowsResult(
+            search_id=search_id,
+            total_matches=total,
+            rows=[row.model_dump(mode="json") for row in rows],
+        )
 
     return ToolSpec(
         name="search_rows",
@@ -39,4 +43,3 @@ def build_spec(context: ToolRuntimeContext) -> ToolSpec:
         examples=[ToolExample(input={"query": "money back"}, output_summary="Rows about refunds.")],
         return_summary="Matching rows and a reusable search_id.",
     )
-

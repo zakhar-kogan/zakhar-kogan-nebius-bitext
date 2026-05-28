@@ -6,6 +6,7 @@ import json
 import re
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -13,7 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from bitext_agent.config import Settings
 from bitext_agent.llm import build_chat_model, invoke_with_usage_log
 from bitext_agent.prompts import PromptStore
-from bitext_agent.schemas import AgentResponse, ReasoningStep, RouteKind, RouterDecision
+from bitext_agent.schemas import AgentEvent, AgentResponse, ReasoningStep, RouteKind, RouterDecision
 from bitext_agent.settings_store import SettingsStore
 from bitext_agent.tools import ToolRegistry
 
@@ -38,6 +39,9 @@ class AgentRunner(ABC):
         route_reason: str = "",
     ) -> AgentResponse:
         """Run one user turn and return a final response plus trace."""
+
+
+CancelCheck = Callable[[], bool]
 
 
 class ChatModelLike(Protocol):
@@ -112,9 +116,32 @@ class LlmReActRunner(AgentRunner):
     ) -> AgentResponse:
         """Execute a bounded ReAct loop for a dataset query."""
 
+        final_response: AgentResponse | None = None
+        for event in self.stream(message, route, checkpoint, route_reason):
+            if event.final_response:
+                final_response = event.final_response
+        if final_response is None:
+            return AgentResponse(
+                answer="I could not complete the request.",
+                route=route,
+                reasoning=[ReasoningStep(kind="error", title="Error", detail="No final response was produced.")],
+            )
+        return final_response
+
+    def stream(
+        self,
+        message: str,
+        route: RouteKind,
+        checkpoint: dict[str, Any],
+        route_reason: str = "",
+        cancel_check: CancelCheck | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Execute a bounded ReAct loop and yield visible progress events."""
+
         if not self.settings.nebius_api_key and not _is_fake_model(self.model):
             raise RuntimeError("NEBIUS_API_KEY is required for LLM agent execution.")
 
+        cancel_check = cancel_check or (lambda: False)
         reasoning = [
             ReasoningStep(
                 kind="route",
@@ -122,29 +149,60 @@ class LlmReActRunner(AgentRunner):
                 detail=f"Classified as {route}." + (f" {route_reason}" if route_reason else ""),
             )
         ]
+        yield _event_from_step(reasoning[-1])
+        if cancel_check():
+            yield _cancelled_event(route, reasoning)
+            return
         show_more_response = self._try_show_more_followup(message, checkpoint, reasoning, route)
         if show_more_response:
-            return show_more_response
+            for step in show_more_response.reasoning[1:]:
+                yield _event_from_step(step)
+            yield AgentEvent(
+                kind="final",
+                title="Final",
+                detail=_shorten(show_more_response.answer),
+                answer_delta=show_more_response.answer,
+                final_response=show_more_response,
+            )
+            return
 
         messages = self._initial_messages(message, route, checkpoint)
 
         for _ in range(self.settings.max_agent_iterations):
+            if cancel_check():
+                yield _cancelled_event(route, reasoning)
+                return
             try:
                 ai_message = self._invoke_model(messages)
             except Exception as exc:
-                return AgentResponse(
+                response = AgentResponse(
                     answer=f"I could not complete the model call: {exc}",
                     route=route,
                     reasoning=reasoning,
                 )
+                yield AgentEvent(kind="error", title="Model call failed", detail=str(exc), final_response=response)
+                return
             messages.append(ai_message)
             tool_calls = getattr(ai_message, "tool_calls", None) or []
             if not tool_calls:
                 answer = _message_text(ai_message)
                 reasoning.append(ReasoningStep(kind="final", title="Final", detail=_shorten(answer)))
-                return AgentResponse(answer=answer, route=route, reasoning=reasoning)
+                response = AgentResponse(answer=answer, route=route, reasoning=reasoning)
+                yield AgentEvent(
+                    kind="final",
+                    title="Final",
+                    detail=_shorten(answer),
+                    answer_delta=answer,
+                    final_response=response,
+                )
+                return
             for tool_call in tool_calls:
+                if cancel_check():
+                    yield _cancelled_event(route, reasoning)
+                    return
                 observation = self._execute_tool_call(tool_call, checkpoint, reasoning)
+                yield _event_from_step(reasoning[-2])
+                yield _event_from_step(reasoning[-1])
                 messages.append(
                     ToolMessage(
                         content=observation,
@@ -157,7 +215,8 @@ class LlmReActRunner(AgentRunner):
             "Please narrow the question or ask for a specific count, examples, distribution, or summary."
         )
         reasoning.append(ReasoningStep(kind="fallback", title="Max iterations", detail=fallback))
-        return AgentResponse(answer=fallback, route=route, reasoning=reasoning)
+        response = AgentResponse(answer=fallback, route=route, reasoning=reasoning)
+        yield AgentEvent(kind="fallback", title="Max iterations", detail=fallback, final_response=response)
 
     def _initial_messages(
         self, message: str, route: RouteKind, checkpoint: dict[str, Any]
@@ -380,3 +439,14 @@ def _shorten(value: str, limit: int = 240) -> str:
 
 def _is_fake_model(model: Any) -> bool:
     return model.__class__.__module__.startswith("tests.") or model.__class__.__name__.startswith("Fake")
+
+
+def _event_from_step(step: ReasoningStep) -> AgentEvent:
+    return AgentEvent(kind=step.kind, title=step.title, detail=step.detail)
+
+
+def _cancelled_event(route: RouteKind, reasoning: list[ReasoningStep]) -> AgentEvent:
+    answer = "Stopped before completion."
+    reasoning.append(ReasoningStep(kind="cancelled", title="Stopped", detail=answer))
+    response = AgentResponse(answer=answer, route=route, reasoning=reasoning)
+    return AgentEvent(kind="cancelled", title="Stopped", detail=answer, final_response=response)
