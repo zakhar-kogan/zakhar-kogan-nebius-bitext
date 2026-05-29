@@ -668,16 +668,24 @@ class SettingsStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_turns(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def list_turns(
+        self, session_id: str, limit: int = 20, user_uuid: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return recent conversation turns in chronological order."""
 
+        sql = """
+                select id, user_uuid, role, content, metadata_json, created_at from conversation_turns
+                where session_id = ?
+                """
+        params: tuple[Any, ...] = (session_id,)
+        if user_uuid is not None:
+            sql += " and user_uuid = ?"
+            params = (session_id, user_uuid)
+        sql += " order by id desc limit ?"
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                select id, user_uuid, role, content, metadata_json, created_at from conversation_turns
-                where session_id = ? order by id desc limit ?
-                """,
-                (session_id, limit),
+                sql,
+                (*params, limit),
             ).fetchall()
         return [
             {

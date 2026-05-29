@@ -100,6 +100,8 @@ def test_session_and_tool_diagnostics(tmp_path) -> None:
 
     sessions = store.list_user_sessions(user_uuid)
     assert {item["session_id"] for item in sessions} == {"s1", "s2"}
+    assert [turn["content"] for turn in store.list_turns("s1", user_uuid=user_uuid)] == ["hello"]
+    assert store.list_turns("s1", user_uuid=other_uuid) == []
 
     store.log_tool_call("s1", user_uuid, "count_rows", "ok", latency_ms=5)
     store.log_tool_call("s1", user_uuid, "show_examples", "error", latency_ms=2, error="bad")

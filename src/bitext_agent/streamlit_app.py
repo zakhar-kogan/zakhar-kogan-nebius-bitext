@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import streamlit as st
 
 from bitext_agent.graph import AgentService
-from bitext_agent.schemas import AgentEvent, AgentResponse
+from bitext_agent.schemas import AgentEvent, AgentResponse, RouteKind
 
 
 IDLE_RECOMMENDATION_DELAY = timedelta(minutes=2)
@@ -108,7 +108,7 @@ def main() -> None:
     key = f"messages:{session_id}:{user_id}"
     st.session_state["active_message_key"] = key
     if key not in st.session_state:
-        st.session_state[key] = []
+        st.session_state[key] = _load_session_messages(service, session_id, user_uuid)
 
     for item in st.session_state[key]:
         if item["role"] == "user":
@@ -118,9 +118,10 @@ def main() -> None:
             response = item["response"]
             with st.chat_message("assistant"):
                 st.write(response.answer)
-                with st.expander("Reasoning"):
-                    for step in response.reasoning:
-                        st.markdown(f"**{step.title}**: {step.detail}")
+                if response.reasoning:
+                    with st.expander("Reasoning"):
+                        for step in response.reasoning:
+                            st.markdown(f"**{step.title}**: {step.detail}")
 
     recommendation_label = "Recommended queries" if st.session_state[key] else "Starter queries"
     if _idle_ready(key):
@@ -142,6 +143,38 @@ def _session_label(session_id: str, sessions: list[dict[str, object]]) -> str:
         if item["session_id"] == session_id:
             return f"{session_id} ({item['user_turns']} user turns, last {item['last_turn']})"
     return f"{session_id} (new/manual)"
+
+
+def _load_session_messages(
+    service: AgentService, session_id: str, user_uuid: str
+) -> list[dict[str, object]]:
+    turns = service.store.list_turns(session_id, limit=1000, user_uuid=user_uuid)
+    messages: list[dict[str, object]] = []
+    for turn in turns:
+        if turn["role"] == "user":
+            messages.append({"role": "user", "content": turn["content"]})
+            continue
+        if turn["role"] == "assistant":
+            metadata = turn["metadata"]
+            route = _valid_route(metadata.get("route"))
+            messages.append(
+                {
+                    "role": "assistant",
+                    "response": AgentResponse(
+                        answer=turn["content"],
+                        route=route,
+                        reasoning=[],
+                        suggested_query=metadata.get("suggested_query"),
+                    ),
+                }
+            )
+    return messages
+
+
+def _valid_route(value: object) -> RouteKind:
+    if value in {"structured", "unstructured", "out_of_scope", "recommendation"}:
+        return value
+    return "structured"
 
 
 def _render_recommendations(
