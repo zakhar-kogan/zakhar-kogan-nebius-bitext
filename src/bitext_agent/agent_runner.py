@@ -305,13 +305,59 @@ class LlmReActRunner(AgentRunner):
             return None
 
         n = _requested_more_count(message) or previous.get("n", 3)
+        offset = previous.get("next_offset") or 0
+        category = previous.get("category")
+        intent = previous.get("intent")
         args = {
-            "category": previous.get("category"),
-            "intent": previous.get("intent"),
-            "search_id": previous.get("search_id"),
+            "category": category,
+            "intent": intent,
+            "search_id": None if category or intent else previous.get("search_id"),
             "n": n,
-            "offset": previous.get("next_offset") or 0,
+            "offset": offset,
         }
+        if not category and not intent and previous.get("query"):
+            search_args = {
+                "category": category,
+                "intent": intent,
+                "query": previous.get("query"),
+                "fuzzy": previous.get("fuzzy", True),
+                "limit": max(offset + n, n),
+            }
+            reasoning.append(ReasoningStep(kind="tool", title="Tool call: search_rows", detail=str(search_args)))
+            start = time.perf_counter()
+            try:
+                search_result = self.registry.call("search_rows", **search_args)
+            except Exception as exc:
+                self.store.log_tool_call(
+                    session_id=self.registry.context.session_id,
+                    user_uuid=self.registry.context.user_uuid,
+                    tool_name="search_rows",
+                    status="error",
+                    latency_ms=int((time.perf_counter() - start) * 1000),
+                    error=str(exc),
+                )
+                detail = f"Tool error: {exc}"
+                reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=detail))
+                return AgentResponse(answer=detail, route=route, reasoning=reasoning)
+            self.store.log_tool_call(
+                session_id=self.registry.context.session_id,
+                user_uuid=self.registry.context.user_uuid,
+                tool_name="search_rows",
+                status="ok",
+                latency_ms=int((time.perf_counter() - start) * 1000),
+            )
+            self._update_checkpoint("search_rows", search_args, search_result, checkpoint)
+            payload = search_result.model_dump(mode="json")
+            reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=_summarize_result(payload)))
+            args["search_id"] = search_result.search_id
+        elif not category and not intent and previous.get("search_id"):
+            answer = (
+                "I cannot resume that example search after restart. "
+                "Please repeat the category, intent, or search phrase."
+            )
+            reasoning.append(ReasoningStep(kind="fallback", title="Search expired", detail=answer))
+            return AgentResponse(answer=answer, route=route, reasoning=reasoning)
+
         reasoning.append(ReasoningStep(kind="tool", title="Tool call: show_examples", detail=str(args)))
         start = time.perf_counter()
         try:
@@ -365,13 +411,22 @@ class LlmReActRunner(AgentRunner):
                 "query": args.get("query"),
                 "category": args.get("category"),
                 "intent": args.get("intent"),
+                "fuzzy": args.get("fuzzy", True),
                 "total_matches": result.total_matches,
             }
         if name == "show_examples":
+            last_search = checkpoint.get("last_search") or {}
+            search_query = None
+            search_fuzzy = None
+            if args.get("search_id") and args.get("search_id") == last_search.get("search_id"):
+                search_query = last_search.get("query")
+                search_fuzzy = last_search.get("fuzzy", True)
             checkpoint["last_examples"] = {
                 "category": args.get("category"),
                 "intent": args.get("intent"),
                 "search_id": args.get("search_id"),
+                "query": search_query,
+                "fuzzy": search_fuzzy,
                 "n": args.get("n", 3),
                 "next_offset": result.next_offset,
             }

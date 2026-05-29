@@ -87,6 +87,35 @@ class FakeAngryModel:
         return AIMessage(content=f"Found {count_observation['count']} rows matching angry customers.")
 
 
+class FakeSearchExamplesModel:
+    """Model double that searches by phrase before showing examples."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "search_rows", "args": {"query": "money back", "limit": 10}, "id": "s1"}],
+            )
+        first_observation = json.loads(tool_messages[0].content)
+        if len(tool_messages) == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "show_examples",
+                        "args": {"search_id": first_observation["search_id"], "n": 1},
+                        "id": "e1",
+                    }
+                ],
+            )
+        return AIMessage(content="Here is the first money-back example.")
+
+
 def _registry(service: AgentService) -> ToolRegistry:
     user_uuid, _ = service.store.get_or_create_user("demo")
     return ToolRegistry(service.repository, service.store, "s", user_uuid)
@@ -397,6 +426,50 @@ def test_show_more_followup_uses_checkpoint_without_model_guessing(test_settings
     assert checkpoint["last_examples"]["next_offset"] is None
     assert model.calls == 0
     assert any(step.title == "Tool call: show_examples" for step in response.reasoning)
+
+
+def test_show_more_followup_replays_search_after_restart(test_settings) -> None:
+    first_service = AgentService(test_settings, router=FakeRouter("structured"))
+    first_model = FakeSearchExamplesModel()
+    checkpoint: dict[str, Any] = {}
+
+    first_response = _runner(first_service, first_model).run(
+        "Show me examples of people wanting their money back.", "structured", checkpoint
+    )
+
+    assert first_response.answer == "Here is the first money-back example."
+    assert first_model.calls == 3
+    assert checkpoint["last_examples"]["query"] == "money back"
+    assert checkpoint["last_examples"]["next_offset"] == 1
+
+    restarted_service = AgentService(test_settings, router=FakeRouter("structured"))
+    unused_model = FakeChatModel([AIMessage(content="should not be used")])
+    response = _runner(restarted_service, unused_model).run("Show me 1 more", "structured", checkpoint)
+
+    assert "Please refund my order" in response.answer
+    assert checkpoint["last_examples"]["next_offset"] is None
+    assert unused_model.calls == 0
+    assert any(step.title == "Tool call: search_rows" for step in response.reasoning)
+    assert any(step.title == "Tool call: show_examples" for step in response.reasoning)
+
+
+def test_show_more_followup_handles_stale_search_id_without_query(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    model = FakeChatModel([AIMessage(content="should not be used")])
+    checkpoint = {
+        "last_examples": {
+            "category": None,
+            "intent": None,
+            "search_id": "stale-search-id",
+            "n": 1,
+            "next_offset": 1,
+        }
+    }
+
+    response = _runner(service, model).run("Show me 1 more", "structured", checkpoint)
+
+    assert "cannot resume" in response.answer
+    assert model.calls == 0
 
 
 def test_max_iteration_fallback(test_settings) -> None:
