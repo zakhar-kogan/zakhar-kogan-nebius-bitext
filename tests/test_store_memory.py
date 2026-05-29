@@ -82,7 +82,13 @@ def test_recommendation_state_and_usage(tmp_path) -> None:
     assert store.get_pending_recommendation("s")["query"] == "query"
     store.record_selected_recommendation("s", "  Query   Text  ")
     assert store.list_selected_recommendation_keys("s") == {"query text"}
+    assert store.list_selected_recommendation_queries("s") == ["  Query   Text  "]
     assert store.list_selected_recommendation_keys("other") == set()
+    store.set_recommendation_slot("s", 0, "q1")
+    store.set_recommendation_slot("s", 1, "q2")
+    assert [slot["query"] for slot in store.list_recommendation_slots("s")] == ["q1", "q2"]
+    store.set_recommendation_slot("s", 0, None)
+    assert [slot["slot_index"] for slot in store.list_recommendation_slots("s")] == [1]
     store.log_usage(model="m", status="ok", session_id="s", user_uuid=user_uuid, total_tokens=3)
     store.log_usage(model="m", status="ok", session_id="other", user_uuid=user_uuid, total_tokens=7)
     assert store.usage_summary()["tokens"] == 10

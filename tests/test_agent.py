@@ -187,7 +187,7 @@ def test_confirmed_recommendation_clears_pending_query(test_settings) -> None:
     assert service.store.get_pending_recommendation("rec-confirm") is None
 
 
-def test_recommend_queries_refresh_after_recommendation_answer(test_settings) -> None:
+def test_recommend_queries_keep_slots_until_clicked(test_settings) -> None:
     service = AgentService(
         test_settings,
         router=FakeRouter("structured"),
@@ -198,8 +198,7 @@ def test_recommend_queries_refresh_after_recommendation_answer(test_settings) ->
     service.run_turn("How many refund requests did we get?", "rec-refresh", "demo")
     after = service.recommend_queries("rec-refresh", "demo", limit=2)
 
-    assert before != after
-    assert after[0] == "Show me 5 examples from the REFUND category."
+    assert before == after
 
 
 def test_recommend_queries_excludes_selected_query_for_session(test_settings) -> None:
@@ -241,6 +240,65 @@ def test_recommend_queries_uses_profile_facts(test_settings) -> None:
     recommendations = service.recommend_queries("rec-ui-profile", "demo", limit=2)
 
     assert "REFUND" in " ".join(recommendations)
+
+
+def test_recommendation_slots_start_with_visible_limit(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+
+    slots = service.recommendation_slots("slot-start", "demo", limit=2)
+
+    assert [slot["slot_index"] for slot in slots] == [0, 1]
+    assert len(slots) == 2
+
+
+def test_recommendation_slot_replacement_keeps_other_slot(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("structured"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+    session_id = "slot-replace"
+    slots = service.recommendation_slots(session_id, "demo", limit=2)
+    clicked = str(slots[0]["query"])
+    unchanged = str(slots[1]["query"])
+
+    service.store.record_selected_recommendation(session_id, clicked)
+    service.run_turn(clicked, session_id, "demo")
+    replacement = service.replace_recommendation_slot(session_id, "demo", 0, limit=2)
+    updated = service.recommendation_slots(session_id, "demo", limit=2)
+
+    assert replacement
+    assert str(updated[0]["query"]) != clicked
+    assert str(updated[1]["query"]) == unchanged
+
+
+def test_recommendation_replacement_rejects_fuzzy_duplicates(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    session_id = "slot-fuzzy"
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.upsert_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User is interested in refund data",
+        "topic_interest:refund",
+        "test",
+    )
+    service.store.record_selected_recommendation(session_id, "Show me 5 examples from REFUND category")
+
+    slots = service.recommendation_slots(session_id, "demo", limit=1)
+
+    assert slots[0]["query"] == "What is the distribution of intents in the REFUND category?"
+
+
+def test_recommendation_slots_empty_when_fresh_candidates_exhausted(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    session_id = "slot-exhausted"
+    for query in service.starter_recommendations():
+        service.store.record_selected_recommendation(session_id, query)
+
+    slots = service.recommendation_slots(session_id, "demo", limit=2)
+
+    assert slots == []
 
 
 def test_stream_turn_emits_tool_events_and_final_response(test_settings) -> None:

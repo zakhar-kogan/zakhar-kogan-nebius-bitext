@@ -103,6 +103,13 @@ class SettingsStore:
                     selected_at text not null,
                     primary key(session_id, normalized_query)
                 );
+                create table if not exists recommendation_slots (
+                    session_id text not null,
+                    slot_index integer not null,
+                    query text not null,
+                    updated_at text not null,
+                    primary key(session_id, slot_index)
+                );
                 create table if not exists conversation_turns (
                     id integer primary key autoincrement,
                     session_id text not null,
@@ -628,6 +635,50 @@ class SettingsStore:
                 (session_id,),
             ).fetchall()
         return {row["normalized_query"] for row in rows}
+
+    def list_selected_recommendation_queries(self, session_id: str) -> list[str]:
+        """Return selected recommendation query text for fuzzy duplicate checks."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "select query from selected_recommendations where session_id = ? order by selected_at asc",
+                (session_id,),
+            ).fetchall()
+        return [str(row["query"]) for row in rows]
+
+    def list_recommendation_slots(self, session_id: str) -> list[dict[str, object]]:
+        """Return currently visible recommendation slots for a session."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select slot_index, query, updated_at from recommendation_slots
+                where session_id = ?
+                order by slot_index asc
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_recommendation_slot(self, session_id: str, slot_index: int, query: str | None) -> None:
+        """Set or clear one visible recommendation slot."""
+
+        with self.connect() as conn:
+            if query is None:
+                conn.execute(
+                    "delete from recommendation_slots where session_id = ? and slot_index = ?",
+                    (session_id, slot_index),
+                )
+                return
+            conn.execute(
+                """
+                insert into recommendation_slots(session_id, slot_index, query, updated_at)
+                values (?, ?, ?, ?)
+                on conflict(session_id, slot_index) do update set
+                query = excluded.query, updated_at = excluded.updated_at
+                """,
+                (session_id, slot_index, query, utc_now()),
+            )
 
     def add_turn(
         self,

@@ -180,20 +180,23 @@ def _valid_route(value: object) -> RouteKind:
 def _render_recommendations(
     service: AgentService, session_id: str, user_id: str, message_key: str, label: str
 ) -> None:
-    if hasattr(service, "recommend_queries"):
-        queries = service.recommend_queries(session_id, user_id, limit=2)
+    if hasattr(service, "recommendation_slots"):
+        slots = service.recommendation_slots(session_id, user_id, limit=2)
     else:
         st.cache_resource.clear()
         st.rerun()
         return
-    if not queries:
+    if not slots:
         return
     st.subheader(label)
-    cols = st.columns(len(queries))
-    for index, query in enumerate(queries):
-        if cols[index].button(query, key=f"recommendation:{message_key}:{index}:{query}"):
+    cols = st.columns(len(slots))
+    for index, slot in enumerate(slots):
+        slot_index = int(slot["slot_index"])
+        query = str(slot["query"])
+        if cols[index].button(query, key=f"recommendation:{message_key}:{slot_index}:{query}"):
             _select_recommendation(service, session_id, query)
             _run_prompt(service, query, session_id, user_id, message_key)
+            service.replace_recommendation_slot(session_id, user_id, slot_index, limit=2)
             st.rerun()
 
 

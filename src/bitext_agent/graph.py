@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
+from rapidfuzz import fuzz
 
 from bitext_agent.agent_runner import AgentRunner, LlmReActRunner, LlmRouter, Router
 from bitext_agent.config import Settings, get_settings
@@ -204,19 +205,49 @@ class AgentService:
     ) -> list[str]:
         """Return starter or profile-aware query recommendations for UI buttons."""
 
+        return [str(slot["query"]) for slot in self.recommendation_slots(session_id, external_user_id, limit)]
+
+    def recommendation_slots(
+        self, session_id: str, external_user_id: str | None, limit: int = 2
+    ) -> list[dict[str, object]]:
+        """Return visible recommendation slots, creating missing slots only."""
+
         user_uuid, _ = self.store.get_or_create_user(external_user_id)
-        facts = self.store.list_profile_facts(user_uuid)
-        recent_text = " ".join(
-            turn["content"].lower() for turn in self.store.list_turns(session_id, limit=8)
-        )
-        candidates = _profile_recommendations([fact.fact for fact in facts]) if facts else []
-        candidates = _recent_recommendations(recent_text) + candidates
-        starters = self.starter_recommendations()
-        selected = self.store.list_selected_recommendation_keys(session_id)
-        recommendations = _exclude_selected(_dedupe(candidates + starters), selected)
-        if recommendations:
-            return recommendations[:limit]
-        return _exclude_selected(starters, selected)[:limit]
+        slots = self.store.list_recommendation_slots(session_id)
+        for index in range(limit):
+            if any(int(slot["slot_index"]) == index for slot in slots):
+                continue
+            replacement = self._next_recommendation(session_id, user_uuid, index, limit)
+            self.store.set_recommendation_slot(session_id, index, replacement)
+            if replacement:
+                slots.append({"slot_index": index, "query": replacement})
+        return [slot for slot in sorted(slots, key=lambda item: int(item["slot_index"])) if int(slot["slot_index"]) < limit]
+
+    def replace_recommendation_slot(
+        self, session_id: str, external_user_id: str | None, slot_index: int, limit: int = 2
+    ) -> str | None:
+        """Replace one consumed recommendation slot using current session context."""
+
+        user_uuid, _ = self.store.get_or_create_user(external_user_id)
+        replacement = self._next_recommendation(session_id, user_uuid, slot_index, limit)
+        self.store.set_recommendation_slot(session_id, slot_index, replacement)
+        return replacement
+
+    def _next_recommendation(
+        self, session_id: str, user_uuid: str, slot_index: int, limit: int
+    ) -> str | None:
+        candidates = _recommendation_candidates(self, session_id, user_uuid)
+        visible = [
+            str(slot["query"])
+            for slot in self.store.list_recommendation_slots(session_id)
+            if int(slot["slot_index"]) != slot_index and int(slot["slot_index"]) < limit
+        ]
+        used = self.store.list_selected_recommendation_queries(session_id)
+        blocked = visible + used
+        for candidate in candidates:
+            if not _is_similar_recommendation(candidate, blocked):
+                return candidate
+        return None
 
     def distill_session(self, session_id: str, external_user_id: str | None) -> list[str]:
         """Distill profile memory for a session on user-controlled boundaries."""
@@ -462,6 +493,15 @@ def _finalize(service: AgentService, state: GraphState) -> GraphState:
     return state
 
 
+def _recommendation_candidates(service: AgentService, session_id: str, user_uuid: str) -> list[str]:
+    facts = service.store.list_profile_facts(user_uuid)
+    recent_text = " ".join(
+        turn["content"].lower() for turn in service.store.list_turns(session_id, limit=8)
+    )
+    candidates = _profile_recommendations([fact.fact for fact in facts]) if facts else []
+    return _dedupe(_recent_recommendations(recent_text) + candidates + service.starter_recommendations())
+
+
 def _profile_recommendations(facts: list[str]) -> list[str]:
     text = " ".join(facts).lower()
     recommendations: list[str] = []
@@ -509,6 +549,17 @@ def _dedupe(values: list[str]) -> list[str]:
 
 def _exclude_selected(values: list[str], selected: set[str]) -> list[str]:
     return [value for value in values if normalize_recommendation_query(value) not in selected]
+
+
+def _is_similar_recommendation(candidate: str, blocked: list[str]) -> bool:
+    candidate_key = normalize_recommendation_query(candidate)
+    for value in blocked:
+        value_key = normalize_recommendation_query(value)
+        if not value_key:
+            continue
+        if candidate_key == value_key or fuzz.token_set_ratio(candidate_key, value_key) >= 90:
+            return True
+    return False
 
 
 def _cancelled_response(route: RouteKind, reasoning: list[ReasoningStep]) -> AgentResponse:
