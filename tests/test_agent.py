@@ -173,6 +173,23 @@ def test_recommend_queries_refresh_after_recommendation_answer(test_settings) ->
     assert after[0] == "Show me 5 examples from the REFUND category."
 
 
+def test_recommend_queries_excludes_selected_query_for_session(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("structured"),
+        runner_factory=lambda registry, service, state: FakeRunner(),
+    )
+    session_id = "rec-rotate"
+    selected = "Summarize how agents respond to complaint intents."
+
+    service.run_turn(selected, session_id, "demo")
+    service.store.record_selected_recommendation(session_id, selected.upper())
+    recommendations = service.recommend_queries(session_id, "demo", limit=2)
+
+    assert selected not in recommendations
+    assert recommendations
+
+
 def test_recommend_queries_uses_starters_without_profile(test_settings) -> None:
     service = AgentService(test_settings, router=FakeRouter("structured"))
 

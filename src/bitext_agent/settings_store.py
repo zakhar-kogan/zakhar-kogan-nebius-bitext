@@ -18,6 +18,12 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def normalize_recommendation_query(query: str) -> str:
+    """Normalize recommendation text for case-insensitive session rotation."""
+
+    return " ".join(query.strip().lower().split())
+
+
 class SettingsStore:
     """Durable SQLite store for app state outside LangGraph checkpoints."""
 
@@ -89,6 +95,13 @@ class SettingsStore:
                     query text not null,
                     reason text not null,
                     updated_at text not null
+                );
+                create table if not exists selected_recommendations (
+                    session_id text not null,
+                    normalized_query text not null,
+                    query text not null,
+                    selected_at text not null,
+                    primary key(session_id, normalized_query)
                 );
                 create table if not exists conversation_turns (
                     id integer primary key autoincrement,
@@ -588,6 +601,33 @@ class SettingsStore:
 
         with self.connect() as conn:
             conn.execute("delete from pending_recommendations where session_id = ?", (session_id,))
+
+    def record_selected_recommendation(self, session_id: str, query: str) -> None:
+        """Record a recommendation button selected during the current session."""
+
+        normalized_query = normalize_recommendation_query(query)
+        if not normalized_query:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into selected_recommendations(session_id, normalized_query, query, selected_at)
+                values (?, ?, ?, ?)
+                on conflict(session_id, normalized_query) do update set
+                query = excluded.query, selected_at = excluded.selected_at
+                """,
+                (session_id, normalized_query, query, utc_now()),
+            )
+
+    def list_selected_recommendation_keys(self, session_id: str) -> set[str]:
+        """Return normalized recommendation queries already selected in a session."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "select normalized_query from selected_recommendations where session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return {row["normalized_query"] for row in rows}
 
     def add_turn(
         self,

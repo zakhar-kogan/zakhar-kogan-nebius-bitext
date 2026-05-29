@@ -159,9 +159,14 @@ def _render_recommendations(
     cols = st.columns(len(queries))
     for index, query in enumerate(queries):
         if cols[index].button(query, key=f"recommendation:{message_key}:{index}:{query}"):
-            service.store.clear_pending_recommendation(session_id)
+            _select_recommendation(service, session_id, query)
             _run_prompt(service, query, session_id, user_id, message_key)
             st.rerun()
+
+
+def _select_recommendation(service: AgentService, session_id: str, query: str) -> None:
+    service.store.record_selected_recommendation(session_id, query)
+    service.store.clear_pending_recommendation(session_id)
 
 
 def _distill_on_conversation_boundary(

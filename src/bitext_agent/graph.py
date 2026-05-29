@@ -22,7 +22,7 @@ from bitext_agent.memory import (
     refresh_session_summary,
 )
 from bitext_agent.schemas import AgentEvent, AgentResponse, ReasoningStep, RouteKind
-from bitext_agent.settings_store import SettingsStore
+from bitext_agent.settings_store import SettingsStore, normalize_recommendation_query
 from bitext_agent.tools import ToolRegistry
 
 
@@ -211,7 +211,12 @@ class AgentService:
         )
         candidates = _profile_recommendations([fact.fact for fact in facts]) if facts else []
         candidates = _recent_recommendations(recent_text) + candidates
-        return _dedupe(candidates + self.starter_recommendations())[:limit]
+        starters = self.starter_recommendations()
+        selected = self.store.list_selected_recommendation_keys(session_id)
+        recommendations = _exclude_selected(_dedupe(candidates + starters), selected)
+        if recommendations:
+            return recommendations[:limit]
+        return _exclude_selected(starters, selected)[:limit]
 
     def distill_session(self, session_id: str, external_user_id: str | None) -> list[str]:
         """Distill profile memory for a session on user-controlled boundaries."""
@@ -500,6 +505,10 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(key)
             result.append(value)
     return result
+
+
+def _exclude_selected(values: list[str], selected: set[str]) -> list[str]:
+    return [value for value in values if normalize_recommendation_query(value) not in selected]
 
 
 def _cancelled_response(route: RouteKind, reasoning: list[ReasoningStep]) -> AgentResponse:

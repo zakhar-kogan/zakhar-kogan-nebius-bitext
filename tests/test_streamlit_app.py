@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from bitext_agent.graph import AgentService
 from bitext_agent.schemas import AgentEvent
-from bitext_agent.streamlit_app import _distill_on_conversation_boundary, _live_reasoning_status
+from bitext_agent.streamlit_app import (
+    _distill_on_conversation_boundary,
+    _live_reasoning_status,
+    _select_recommendation,
+)
 
 
 def test_live_reasoning_status_stays_compact() -> None:
@@ -26,6 +30,17 @@ def test_new_chat_boundary_distills_per_conversation_memory(test_settings) -> No
     saved = _distill_on_conversation_boundary(service, "chat-1", "demo")
 
     assert saved == ["User's name is Alice"]
+
+
+def test_select_recommendation_records_rotation_and_clears_pending(test_settings) -> None:
+    service = AgentService(test_settings)
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation("chat-1", user_uuid, "query", "reason")
+
+    _select_recommendation(service, "chat-1", "Query")
+
+    assert service.store.get_pending_recommendation("chat-1") is None
+    assert service.store.list_selected_recommendation_keys("chat-1") == {"query"}
 
 
 def test_new_chat_boundary_skips_non_conversation_memory_modes(test_settings) -> None:

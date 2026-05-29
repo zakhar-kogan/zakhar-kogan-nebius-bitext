@@ -80,6 +80,9 @@ def test_recommendation_state_and_usage(tmp_path) -> None:
     assert store.get_cached_recommendations("k") == ["q1"]
     store.set_pending_recommendation("s", "u", "query", "reason")
     assert store.get_pending_recommendation("s")["query"] == "query"
+    store.record_selected_recommendation("s", "  Query   Text  ")
+    assert store.list_selected_recommendation_keys("s") == {"query text"}
+    assert store.list_selected_recommendation_keys("other") == set()
     store.log_usage(model="m", status="ok", session_id="s", user_uuid=user_uuid, total_tokens=3)
     store.log_usage(model="m", status="ok", session_id="other", user_uuid=user_uuid, total_tokens=7)
     assert store.usage_summary()["tokens"] == 10
