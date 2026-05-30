@@ -11,7 +11,21 @@ services:
     build: .
     env_file:
       - .env
-    command: ["uv", "run", "fastmcp", "run", "src/bitext_agent/mcp_server.py:mcp"]
+    command:
+      [
+        "uv",
+        "run",
+        "fastmcp",
+        "run",
+        "--transport",
+        "http",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "src/bitext_agent/mcp_server.py:mcp",
+      ]
+    ports:
+      - "8000:8000"
     volumes:
       - ./data:/app/data
-
