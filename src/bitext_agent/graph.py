@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from rapidfuzz import fuzz
@@ -15,14 +17,20 @@ from rapidfuzz import fuzz
 from bitext_agent.agent_runner import AgentRunner, LlmReActRunner, LlmRouter, Router
 from bitext_agent.config import Settings, get_settings
 from bitext_agent.data import DatasetRepository
-from bitext_agent.llm import configure_langsmith
+from bitext_agent.llm import build_chat_model, configure_langsmith, invoke_with_usage_log
 from bitext_agent.prompts import PromptStore
 from bitext_agent.memory import (
     ConversationCheckpointStore,
     distill_profile_memory,
     refresh_session_summary,
 )
-from bitext_agent.schemas import AgentEvent, AgentResponse, ReasoningStep, RouteKind
+from bitext_agent.schemas import (
+    AgentEvent,
+    AgentResponse,
+    ReasoningStep,
+    RecommendationRefinementResult,
+    RouteKind,
+)
 from bitext_agent.settings_store import SettingsStore, normalize_recommendation_query
 from bitext_agent.tools import ToolRegistry
 
@@ -39,6 +47,61 @@ class GraphState(TypedDict, total=False):
     response: AgentResponse
 
 
+class RecommendationRefiner(Protocol):
+    """Interface for interpreting semantic changes to pending recommendations."""
+
+    def refine(
+        self, message: str, pending: dict[str, str], session_id: str, user_uuid: str
+    ) -> RecommendationRefinementResult:
+        """Return a refined query or mark the request unclear."""
+
+
+class LlmRecommendationRefiner:
+    """Nebius-backed structured refiner for pending recommendation changes."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        store: SettingsStore,
+        prompt_store: PromptStore,
+        repository: DatasetRepository,
+    ) -> None:
+        self.settings = settings
+        self.store = store
+        self.prompt_store = prompt_store
+        self.repository = repository
+        model = build_chat_model(settings, settings.active_recommender_model, temperature=0.0)
+        self.chain = model.with_structured_output(RecommendationRefinementResult, method="json_mode")
+
+    def refine(
+        self, message: str, pending: dict[str, str], session_id: str, user_uuid: str
+    ) -> RecommendationRefinementResult:
+        """Interpret a user's requested change to the pending recommendation."""
+
+        if not self.settings.nebius_api_key:
+            raise RuntimeError("NEBIUS_API_KEY is required for recommendation refinement.")
+        context = {
+            "pending_recommendation": pending,
+            "recent_turns": self.store.list_turns(session_id, limit=8),
+            "profile_facts": [
+                fact.model_dump(mode="json") for fact in self.store.list_profile_facts(user_uuid)
+            ],
+            "dataset_status": self.repository.dataset_status(),
+        }
+        messages = [
+            SystemMessage(content=self.prompt_store.load("recommendation_refinement")),
+            SystemMessage(content="Runtime context JSON:\n" + json.dumps(context, default=str)),
+            HumanMessage(content=message),
+        ]
+        return invoke_with_usage_log(
+            self.store,
+            self.settings.active_recommender_model,
+            session_id,
+            user_uuid,
+            lambda: self.chain.invoke(messages),
+        )
+
+
 class AgentService:
     """Application service that wires settings, stores, data tools, and graph execution."""
 
@@ -47,6 +110,7 @@ class AgentService:
         settings: Settings | None = None,
         router: Router | None = None,
         runner_factory: Any | None = None,
+        recommendation_refiner: RecommendationRefiner | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         configure_langsmith(self.settings)
@@ -60,6 +124,9 @@ class AgentService:
         self.prompt_store = PromptStore(self.store)
         self.router = router or LlmRouter(self.settings, self.store, self.prompt_store)
         self.runner_factory = runner_factory
+        self.recommendation_refiner = recommendation_refiner or LlmRecommendationRefiner(
+            self.settings, self.store, self.prompt_store, self.repository
+        )
 
     def run_turn(self, message: str, session_id: str, external_user_id: str | None) -> AgentResponse:
         """Run one conversation turn and persist history plus checkpoint state."""
@@ -385,7 +452,7 @@ def _query_recommendation(service: AgentService, state: GraphState) -> GraphStat
         session_id=state["session_id"],
         user_uuid=state["user_uuid"],
     )
-    lower = state["message"].lower().strip()
+    normalized_reply = _normalize_recommendation_reply(state["message"])
     pending = service.store.get_pending_recommendation(state["session_id"])
     reasoning = [
         ReasoningStep(
@@ -394,7 +461,7 @@ def _query_recommendation(service: AgentService, state: GraphState) -> GraphStat
             detail=f"Classified as recommendation. {state.get('route_reason', '')}".strip(),
         )
     ]
-    if pending and re.fullmatch(r"(yes|y|do it|go ahead|please do|run it|execute it)[.! ]*", lower):
+    if pending and _is_recommendation_confirmation(normalized_reply):
         service.store.clear_pending_recommendation(state["session_id"])
         reasoning.append(ReasoningStep(kind="recommendation", title="Confirmed", detail=pending["query"]))
         next_state = {**state, "message": pending["query"], "route": "structured", "route_reason": "Confirmed pending recommendation."}
@@ -402,11 +469,37 @@ def _query_recommendation(service: AgentService, state: GraphState) -> GraphStat
         executed_response = executed["response"]
         executed_response.reasoning = reasoning + executed_response.reasoning
         return {**state, "checkpoint": executed.get("checkpoint", state.get("checkpoint", {})), "response": executed_response}
-    if pending and any(term in lower for term in ["example", "summar", "count", "distribution"]):
-        query = _refine_recommendation(lower, pending["query"])
-        service.store.set_pending_recommendation(
-            state["session_id"], state["user_uuid"], query, "Refined based on your preference."
+    if pending and _is_recommendation_cancellation(normalized_reply):
+        service.store.clear_pending_recommendation(state["session_id"])
+        answer = "Okay, I cancelled that suggestion. What would you like to explore instead?"
+        reasoning.append(ReasoningStep(kind="recommendation", title="Cancelled", detail=pending["query"]))
+        return {
+            **state,
+            "response": AgentResponse(answer=answer, route="recommendation", reasoning=reasoning),
+        }
+    if pending:
+        refinement = service.recommendation_refiner.refine(
+            state["message"], pending, state["session_id"], state["user_uuid"]
         )
+        query = refinement.refined_query.strip() if refinement.refined_query else ""
+        if refinement.unclear or not query:
+            answer = (
+                f"I still have this pending suggestion: {pending['query']}\n"
+                "Should I run it, change it, or cancel it?"
+            )
+            reasoning.append(
+                ReasoningStep(kind="recommendation", title="Needs clarification", detail=refinement.reason)
+            )
+            return {
+                **state,
+                "response": AgentResponse(
+                    answer=answer,
+                    route="recommendation",
+                    reasoning=reasoning,
+                    suggested_query=pending["query"],
+                ),
+            }
+        service.store.set_pending_recommendation(state["session_id"], state["user_uuid"], query, refinement.reason)
         reasoning.append(ReasoningStep(kind="recommendation", title="Refined", detail=query))
         return {
             **state,
@@ -441,22 +534,32 @@ def _query_recommendation(service: AgentService, state: GraphState) -> GraphStat
     }
 
 
-def _refine_recommendation(message: str, previous: str) -> str:
-    if "example" in message:
-        if "refund" in previous.lower():
-            return "Show me 5 examples from the REFUND category."
-        if "account" in previous.lower():
-            return "Show me 5 examples from the ACCOUNT category."
-        if "complaint" in previous.lower():
-            return "Show me 5 examples from the FEEDBACK category."
-        return "Show me 5 examples from the dataset."
-    if "summar" in message:
-        return "Summarize how agents respond to complaint intents."
-    if "count" in message:
-        return "How many refund requests did we get?"
-    if "distribution" in message:
-        return "What is the distribution of intents in the REFUND category?"
-    return previous
+def _normalize_recommendation_reply(message: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", message.lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _is_recommendation_confirmation(normalized: str) -> bool:
+    return normalized in {
+        "yes",
+        "y",
+        "yep",
+        "yeah",
+        "sure",
+        "ok",
+        "okay",
+        "do it",
+        "yes do it",
+        "sure do it",
+        "go ahead",
+        "please do",
+        "run it",
+        "execute it",
+    }
+
+
+def _is_recommendation_cancellation(normalized: str) -> bool:
+    return normalized in {"no", "nope", "cancel", "never mind", "dont", "don t", "do not"}
 
 
 def _memory_distillation(service: AgentService, state: GraphState) -> GraphState:

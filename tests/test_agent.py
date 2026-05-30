@@ -10,7 +10,13 @@ from langchain_core.messages import AIMessage, ToolMessage
 from bitext_agent.agent_runner import AgentRunner, LlmReActRunner, Router
 from bitext_agent.graph import AgentService
 from bitext_agent.prompts import PromptStore
-from bitext_agent.schemas import AgentResponse, ReasoningStep, RouteKind, RouterDecision
+from bitext_agent.schemas import (
+    AgentResponse,
+    ReasoningStep,
+    RecommendationRefinementResult,
+    RouteKind,
+    RouterDecision,
+)
 from bitext_agent.tools import ToolRegistry
 
 
@@ -43,6 +49,20 @@ class FakeRunner(AgentRunner):
             route=route,
             reasoning=[ReasoningStep(kind="route", title="Router", detail=route_reason)],
         )
+
+
+class FakeRecommendationRefiner:
+    """Recommendation refinement test double returning a fixed decision."""
+
+    def __init__(self, result: RecommendationRefinementResult) -> None:
+        self.result = result
+        self.calls = 0
+
+    def refine(
+        self, message: str, pending: dict[str, str], session_id: str, user_uuid: str
+    ) -> RecommendationRefinementResult:
+        self.calls += 1
+        return self.result
 
 
 class FakeChatModel:
@@ -185,6 +205,110 @@ def test_confirmed_recommendation_clears_pending_query(test_settings) -> None:
 
     assert response.route == "structured"
     assert service.store.get_pending_recommendation("rec-confirm") is None
+
+
+def test_recommendation_sure_confirms_pending_query(test_settings) -> None:
+    fake_runner = FakeRunner()
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "confirmed"),
+        runner_factory=lambda registry, service, state: fake_runner,
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-sure", user_uuid, "How many refund requests did we get?", "test"
+    )
+
+    response = service.run_turn("sure", "rec-sure", "demo")
+
+    assert response.route == "structured"
+    assert fake_runner.calls == 1
+    assert service.store.get_pending_recommendation("rec-sure") is None
+
+
+def test_recommendation_yes_do_it_confirms_with_punctuation(test_settings) -> None:
+    fake_runner = FakeRunner()
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "confirmed"),
+        runner_factory=lambda registry, service, state: fake_runner,
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-yes-do-it", user_uuid, "How many refund requests did we get?", "test"
+    )
+
+    response = service.run_turn('"Yes, do it. "', "rec-yes-do-it", "demo")
+
+    assert response.route == "structured"
+    assert fake_runner.calls == 1
+    assert service.store.get_pending_recommendation("rec-yes-do-it") is None
+
+
+def test_recommendation_no_clears_pending_without_runner(test_settings) -> None:
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "cancelled"),
+        runner_factory=lambda registry, service, state: (_ for _ in ()).throw(AssertionError("runner called")),
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-cancel", user_uuid, "How many refund requests did we get?", "test"
+    )
+
+    response = service.run_turn("no", "rec-cancel", "demo")
+
+    assert response.route == "recommendation"
+    assert "cancelled" in response.answer
+    assert service.store.get_pending_recommendation("rec-cancel") is None
+
+
+def test_stream_turn_emits_recommendation_refinement_event(test_settings) -> None:
+    refiner = FakeRecommendationRefiner(
+        RecommendationRefinementResult(
+            refined_query="Show me 5 examples from the REFUND category.",
+            reason="User wants examples instead.",
+            unclear=False,
+        )
+    )
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "refine pending"),
+        recommendation_refiner=refiner,
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-refine", user_uuid, "What is the distribution of intents in the REFUND category?", "test"
+    )
+
+    events = list(service.stream_turn("I'd rather see examples instead.", "rec-refine", "demo"))
+
+    assert any(event.kind == "recommendation" and event.title == "Refined" for event in events)
+    assert events[-1].final_response is not None
+    assert "Should I go ahead?" in events[-1].final_response.answer
+    assert refiner.calls == 1
+
+
+def test_unclear_recommendation_reply_does_not_create_new_suggestion(test_settings) -> None:
+    refiner = FakeRecommendationRefiner(
+        RecommendationRefinementResult(refined_query=None, reason="Request is unclear.", unclear=True)
+    )
+    service = AgentService(
+        test_settings,
+        router=FakeRouter("recommendation", "unclear pending"),
+        recommendation_refiner=refiner,
+    )
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.set_pending_recommendation(
+        "rec-unclear", user_uuid, "Show me 5 examples from the REFUND category.", "test"
+    )
+
+    response = service.run_turn("hmm", "rec-unclear", "demo")
+
+    assert "I still have this pending suggestion" in response.answer
+    assert response.suggested_query == "Show me 5 examples from the REFUND category."
+    assert service.store.get_pending_recommendation("rec-unclear")["query"] == response.suggested_query
+    assert refiner.calls == 1
 
 
 def test_recommend_queries_keep_slots_until_clicked(test_settings) -> None:
@@ -528,6 +652,65 @@ def test_show_more_followup_handles_stale_search_id_without_query(test_settings)
 
     assert "cannot resume" in response.answer
     assert model.calls == 0
+
+
+def test_count_followup_uses_react_loop_and_tools(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    checkpoint: dict[str, Any] = {}
+
+    first_model = FakeChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "count_rows", "args": {"category": "COMPLAINT"}, "id": "c1"}],
+            ),
+            AIMessage(content="COMPLAINT has 1 matching row."),
+        ]
+    )
+    first_response = _runner(service, first_model).run(
+        "How many complaints did we get?", "structured", checkpoint
+    )
+
+    assert first_response.answer == "COMPLAINT has 1 matching row."
+    assert checkpoint["last_counts"] == [{"label": "COMPLAINT", "count": 1}]
+
+    model = FakeChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "count_rows", "args": {"category": "REFUND"}, "id": "r1"}],
+            ),
+            AIMessage(content="REFUND has 2 matching rows."),
+        ]
+    )
+
+    response = _runner(service, model).run("What about refunds?", "structured", checkpoint)
+
+    assert response.answer == "REFUND has 2 matching rows."
+    assert checkpoint["last_counts"][-1] == {"label": "REFUND", "count": 2}
+    assert model.calls == 2
+    assert any(step.title == "Tool call: count_rows" for step in response.reasoning)
+    assert any(step.title == "Observation" and "count=2" in step.detail for step in response.reasoning)
+
+
+def test_last_two_count_total_uses_react_context(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    model = FakeChatModel([AIMessage(content="The total count of the last two is 3.")])
+    checkpoint = {
+        "last_counts": [
+            {"label": "ACCOUNT", "count": 1},
+            {"label": "COMPLAINT", "count": 1},
+            {"label": "REFUND", "count": 2},
+        ]
+    }
+
+    response = _runner(service, model).run(
+        "What is the total count of the last two?", "structured", checkpoint
+    )
+
+    assert response.answer == "The total count of the last two is 3."
+    assert checkpoint["last_counts"][-1] == {"label": "REFUND", "count": 2}
+    assert model.calls == 1
 
 
 def test_max_iteration_fallback(test_settings) -> None:

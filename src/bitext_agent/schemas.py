@@ -29,7 +29,17 @@ class AgentResponse(BaseModel):
     suggested_query: str | None = None
 
 
-AgentEventKind = Literal["route", "tool", "observation", "final", "fallback", "memory", "cancelled", "error"]
+AgentEventKind = Literal[
+    "route",
+    "tool",
+    "observation",
+    "final",
+    "fallback",
+    "memory",
+    "recommendation",
+    "cancelled",
+    "error",
+]
 
 
 class AgentEvent(BaseModel):
@@ -159,3 +169,11 @@ class RecommendationResult(BaseModel):
     query: str
     reason: str
     pending: bool = True
+
+
+class RecommendationRefinementResult(BaseModel):
+    """Structured interpretation of a user's requested change to a pending recommendation."""
+
+    refined_query: str | None = None
+    reason: str
+    unclear: bool = False

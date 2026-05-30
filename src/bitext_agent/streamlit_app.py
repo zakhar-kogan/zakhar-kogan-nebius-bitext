@@ -189,6 +189,10 @@ def _render_recommendations(
     if not slots:
         return
     st.subheader(label)
+    st.caption(
+        "These shortcut buttons run immediately. For suggest-confirm-execute flow, ask: "
+        "What should I query next?"
+    )
     cols = st.columns(len(slots))
     for index, slot in enumerate(slots):
         slot_index = int(slot["slot_index"])
