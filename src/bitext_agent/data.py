@@ -145,6 +145,31 @@ class DatasetRepository:
         ).fetchall()
         return [{"intent": row[0], "count": int(row[1])} for row in rows]
 
+    def category_distribution(self) -> list[dict[str, int | str]]:
+        """Return row counts by top-level category."""
+
+        df = self.load()
+        rows = (
+            df.group_by("category")
+            .agg(pl.len().alias("count"))
+            .sort(["count", "category"], descending=[True, False])
+            .iter_rows(named=True)
+        )
+        return [{"category": row["category"], "count": int(row["count"])} for row in rows]
+
+    def top_intents(self, limit: int = 10) -> list[dict[str, int | str]]:
+        """Return the most common intents across all categories."""
+
+        df = self.load()
+        rows = (
+            df.group_by("intent")
+            .agg(pl.len().alias("count"))
+            .sort(["count", "intent"], descending=[True, False])
+            .head(limit)
+            .iter_rows(named=True)
+        )
+        return [{"intent": row["intent"], "count": int(row["count"])} for row in rows]
+
     def sample_for_summary(
         self,
         category: str | None = None,

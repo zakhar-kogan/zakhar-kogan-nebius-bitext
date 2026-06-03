@@ -32,6 +32,13 @@ def count_rows(category: str | None = None, intent: str | None = None) -> dict:
 
 
 @mcp.tool
+def category_distribution() -> dict:
+    """Return row counts by top-level support category."""
+
+    return registry.call("category_distribution").model_dump()
+
+
+@mcp.tool
 def show_examples(
     category: str | None = None,
     intent: str | None = None,
@@ -50,4 +57,3 @@ def intent_distribution(category: str | None = None) -> dict:
     """Return intent counts for a category or for the full dataset."""
 
     return registry.call("intent_distribution", category=category).model_dump()
-

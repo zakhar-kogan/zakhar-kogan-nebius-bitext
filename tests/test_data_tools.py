@@ -59,8 +59,29 @@ def test_tool_specs_and_registration(tmp_path, sample_dataset) -> None:
     names = {spec.name for spec in registry.public_specs()}
     assert "count_rows" in names
     assert "show_examples" in names
+    assert "category_distribution" in names
+    assert "chart_summary" in names
     result = registry.call("count_rows", category="REFUND")
     assert result.count == 2
+
+
+def test_distribution_helpers_return_sorted_counts(sample_dataset) -> None:
+    repo = DatasetRepository(sample_dataset)
+
+    assert repo.category_distribution()[0] == {"category": "REFUND", "count": 2}
+    assert repo.top_intents(limit=1) == [{"intent": "get_refund", "count": 2}]
+
+
+def test_chart_summary_tool_returns_chart_artifact(tmp_path, sample_dataset) -> None:
+    repo = DatasetRepository(sample_dataset)
+    store = SettingsStore(tmp_path / "app.sqlite")
+    registry = ToolRegistry(repo, store, session_id="s", user_uuid="u")
+
+    result = registry.call("chart_summary", chart_kind="category_distribution")
+
+    assert result.artifact.title == "Rows by category"
+    assert result.artifact.x == "category"
+    assert result.artifact.rows[0] == {"category": "REFUND", "count": 2}
 
 
 def test_row_tools_validate_serialized_rows_from_foreign_model(tmp_path) -> None:

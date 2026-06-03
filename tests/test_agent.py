@@ -350,6 +350,14 @@ def test_recommend_queries_uses_starters_without_profile(test_settings) -> None:
     assert recommendations == service.starter_recommendations()[:2]
 
 
+def test_recommend_queries_include_visual_starter(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+
+    recommendations = service.recommend_queries("rec-ui-visual", "demo", limit=3)
+
+    assert "Show a bar chart of the category breakdown." in recommendations
+
+
 def test_recommend_queries_uses_profile_facts(test_settings) -> None:
     service = AgentService(test_settings, router=FakeRouter("structured"))
     user_uuid, _ = service.store.get_or_create_user("demo")
@@ -364,6 +372,22 @@ def test_recommend_queries_uses_profile_facts(test_settings) -> None:
     recommendations = service.recommend_queries("rec-ui-profile", "demo", limit=2)
 
     assert "REFUND" in " ".join(recommendations)
+
+
+def test_refund_recommendations_include_visual_chart(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    user_uuid, _ = service.store.get_or_create_user("demo")
+    service.store.upsert_profile_fact(
+        user_uuid,
+        "topic_interest",
+        "User is interested in refund data",
+        "topic_interest:refund",
+        "test",
+    )
+
+    recommendations = service.recommend_queries("rec-ui-profile-visual", "demo", limit=3)
+
+    assert "Show a bar chart of intent distribution for REFUND." in recommendations
 
 
 def test_recommendation_slots_start_with_visible_limit(test_settings) -> None:
@@ -540,6 +564,31 @@ def test_react_loop_executes_tool_and_final_answer(test_settings) -> None:
     assert response.answer == "REFUND: 2 rows."
     assert model.calls == 2
     assert any(step.title == "Tool call: count_rows" for step in response.reasoning)
+
+
+def test_react_loop_attaches_chart_artifact(test_settings) -> None:
+    service = AgentService(test_settings, router=FakeRouter("structured"))
+    model = FakeChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "chart_summary",
+                        "args": {"chart_kind": "category_distribution"},
+                        "id": "t1",
+                    }
+                ],
+            ),
+            AIMessage(content="Here is the category breakdown."),
+        ]
+    )
+
+    response = _runner(service, model).run("Show a category chart", "structured", {})
+
+    assert response.answer == "Here is the category breakdown."
+    assert response.visual_artifacts[0].title == "Rows by category"
+    assert response.visual_artifacts[0].rows[0] == {"category": "REFUND", "count": 2}
 
 
 def test_profile_memory_question_can_use_profile_tool(test_settings) -> None:

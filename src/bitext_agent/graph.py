@@ -153,7 +153,13 @@ class AgentService:
             user_uuid,
             "assistant",
             response.answer,
-            {"route": response.route, "suggested_query": response.suggested_query},
+            {
+                "route": response.route,
+                "suggested_query": response.suggested_query,
+                "visual_artifacts": [
+                    artifact.model_dump(mode="json") for artifact in response.visual_artifacts
+                ],
+            },
         )
         refresh_session_summary(
             self.store,
@@ -236,7 +242,14 @@ class AgentService:
                     user_uuid,
                     "assistant",
                     final_response.answer,
-                    {"route": final_response.route, "suggested_query": final_response.suggested_query},
+                    {
+                        "route": final_response.route,
+                        "suggested_query": final_response.suggested_query,
+                        "visual_artifacts": [
+                            artifact.model_dump(mode="json")
+                            for artifact in final_response.visual_artifacts
+                        ],
+                    },
                 )
                 refresh_session_summary(
                     self.store,
@@ -252,7 +265,7 @@ class AgentService:
         status = self.repository.dataset_status()
         if not status.get("exists"):
             return ["Run uv run python scripts/download_dataset.py, then ask what categories exist."]
-        cache_key = f"starter:{status.get('rows')}:{status.get('categories')}:{status.get('intents')}"
+        cache_key = f"starter:v2:{status.get('rows')}:{status.get('categories')}:{status.get('intents')}"
         cached = self.store.get_cached_recommendations(cache_key)
         if cached:
             return cached
@@ -261,6 +274,8 @@ class AgentService:
         recommendations = [
             "What categories exist in the dataset?",
             "How many refund requests did we get?",
+            "Show a bar chart of the category breakdown.",
+            "Show a bar chart of the top intents.",
             f"What is the distribution of intents in the {first} category?",
             "Summarize how agents respond to complaint intents.",
         ]
@@ -612,6 +627,12 @@ def _profile_recommendations(facts: list[str]) -> list[str]:
         recommendations.extend([
             "Show me 5 examples from the REFUND category.",
             "What is the distribution of intents in the REFUND category?",
+            "Show a bar chart of intent distribution for REFUND.",
+        ])
+    if any(term in text for term in ["shipping", "shipment", "delivery"]):
+        recommendations.extend([
+            "Show me 5 examples from the SHIPPING category.",
+            "Show a bar chart of intent distribution for SHIPPING.",
         ])
     if any(term in text for term in ["complaint", "angry", "frustrated", "escalation"]):
         recommendations.extend([
@@ -634,6 +655,9 @@ def _recent_recommendations(recent_text: str) -> list[str]:
     recommendations: list[str] = []
     if "refund" in recent_text or "money back" in recent_text:
         recommendations.append("Show me 5 examples from the REFUND category.")
+        recommendations.append("Show a bar chart of intent distribution for REFUND.")
+    if "shipping" in recent_text or "shipment" in recent_text:
+        recommendations.append("Show a bar chart of intent distribution for SHIPPING.")
     if "complaint" in recent_text:
         recommendations.append("Summarize how agents respond to complaint intents.")
     return recommendations
