@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 RouteKind = Literal["structured", "unstructured", "out_of_scope", "recommendation"]
@@ -20,15 +20,6 @@ class ReasoningStep(BaseModel):
     detail: str = ""
 
 
-class AgentResponse(BaseModel):
-    """Final response returned to CLI, Streamlit, and tests."""
-
-    answer: str
-    route: RouteKind
-    reasoning: list[ReasoningStep] = Field(default_factory=list)
-    suggested_query: str | None = None
-
-
 AgentEventKind = Literal[
     "route",
     "tool",
@@ -40,16 +31,6 @@ AgentEventKind = Literal[
     "cancelled",
     "error",
 ]
-
-
-class AgentEvent(BaseModel):
-    """Incremental user-visible event emitted while a turn is running."""
-
-    kind: AgentEventKind
-    title: str
-    detail: str = ""
-    answer_delta: str = ""
-    final_response: AgentResponse | None = None
 
 
 class RouterDecision(BaseModel):
@@ -132,6 +113,67 @@ class IntentDistributionResult(BaseModel):
     """Intent counts for a category or the whole dataset."""
 
     distribution: list[dict[str, int | str]]
+
+
+class CategoryDistributionResult(BaseModel):
+    """Category counts for the whole dataset."""
+
+    distribution: list[dict[str, int | str]]
+
+
+class ChartArtifact(BaseModel):
+    """A deterministic chart payload renderable by Streamlit or another client."""
+
+    title: str
+    chart_type: Literal["bar"] = "bar"
+    x: str
+    y: str
+    rows: list[dict[str, int | str]]
+
+
+class ChartSummaryResult(BaseModel):
+    """Chart metadata and rows for visual chat rendering."""
+
+    artifact: ChartArtifact
+
+
+class AgentResponse(BaseModel):
+    """Final response returned to CLI, Streamlit, and tests."""
+
+    answer: str
+    route: RouteKind
+    reasoning: list[ReasoningStep] = Field(default_factory=list)
+    suggested_query: str | None = None
+    visual_artifacts: list[ChartArtifact] = Field(default_factory=list)
+
+    @field_validator("visual_artifacts", mode="before")
+    @classmethod
+    def normalize_visual_artifacts(cls, value: object) -> object:
+        """Accept artifacts left in Streamlit state across hot reloads."""
+
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        normalized: list[object] = []
+        for item in value:
+            if isinstance(item, ChartArtifact):
+                normalized.append(item)
+            elif hasattr(item, "model_dump"):
+                normalized.append(item.model_dump(mode="json"))
+            else:
+                normalized.append(item)
+        return normalized
+
+
+class AgentEvent(BaseModel):
+    """Incremental user-visible event emitted while a turn is running."""
+
+    kind: AgentEventKind
+    title: str
+    detail: str = ""
+    answer_delta: str = ""
+    final_response: AgentResponse | None = None
 
 
 class SummaryResult(BaseModel):

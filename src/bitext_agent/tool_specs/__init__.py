@@ -23,6 +23,8 @@ def all_tool_specs(context: ToolRuntimeContext) -> list[ToolSpec]:
     """Return all active versioned tool specs for the current runtime context."""
 
     from bitext_agent.tool_specs.count_rows import build_spec as count_rows
+    from bitext_agent.tool_specs.category_distribution import build_spec as category_distribution
+    from bitext_agent.tool_specs.chart_summary import build_spec as chart_summary
     from bitext_agent.tool_specs.get_user_profile import build_spec as get_user_profile
     from bitext_agent.tool_specs.intent_distribution import build_spec as intent_distribution
     from bitext_agent.tool_specs.list_categories import build_spec as list_categories
@@ -37,6 +39,8 @@ def all_tool_specs(context: ToolRuntimeContext) -> list[ToolSpec]:
         list_intents(context),
         search_rows(context),
         count_rows(context),
+        category_distribution(context),
+        chart_summary(context),
         show_examples(context),
         intent_distribution(context),
         summarize_records(context),
@@ -44,4 +48,3 @@ def all_tool_specs(context: ToolRuntimeContext) -> list[ToolSpec]:
         recommend_next_query(context),
     ]
     return [spec for spec in specs if spec.status == "active"]
-

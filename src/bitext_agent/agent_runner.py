@@ -14,7 +14,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from bitext_agent.config import Settings
 from bitext_agent.llm import build_chat_model, invoke_with_usage_log
 from bitext_agent.prompts import PromptStore
-from bitext_agent.schemas import AgentEvent, AgentResponse, ReasoningStep, RouteKind, RouterDecision
+from bitext_agent.schemas import (
+    AgentEvent,
+    AgentResponse,
+    ChartArtifact,
+    ReasoningStep,
+    RouteKind,
+    RouterDecision,
+)
 from bitext_agent.settings_store import SettingsStore
 from bitext_agent.tools import ToolRegistry
 
@@ -149,6 +156,7 @@ class LlmReActRunner(AgentRunner):
                 detail=f"Classified as {route}." + (f" {route_reason}" if route_reason else ""),
             )
         ]
+        visual_artifacts: list[ChartArtifact] = []
         yield _event_from_step(reasoning[-1])
         if cancel_check():
             yield _cancelled_event(route, reasoning)
@@ -187,7 +195,12 @@ class LlmReActRunner(AgentRunner):
             if not tool_calls:
                 answer = _message_text(ai_message)
                 reasoning.append(ReasoningStep(kind="final", title="Final", detail=_shorten(answer)))
-                response = AgentResponse(answer=answer, route=route, reasoning=reasoning)
+                response = AgentResponse(
+                    answer=answer,
+                    route=route,
+                    reasoning=reasoning,
+                    visual_artifacts=visual_artifacts,
+                )
                 yield AgentEvent(
                     kind="final",
                     title="Final",
@@ -200,7 +213,7 @@ class LlmReActRunner(AgentRunner):
                 if cancel_check():
                     yield _cancelled_event(route, reasoning)
                     return
-                observation = self._execute_tool_call(tool_call, checkpoint, reasoning)
+                observation = self._execute_tool_call(tool_call, checkpoint, reasoning, visual_artifacts)
                 yield _event_from_step(reasoning[-2])
                 yield _event_from_step(reasoning[-1])
                 messages.append(
@@ -215,7 +228,12 @@ class LlmReActRunner(AgentRunner):
             "Please narrow the question or ask for a specific count, examples, distribution, or summary."
         )
         reasoning.append(ReasoningStep(kind="fallback", title="Max iterations", detail=fallback))
-        response = AgentResponse(answer=fallback, route=route, reasoning=reasoning)
+        response = AgentResponse(
+            answer=fallback,
+            route=route,
+            reasoning=reasoning,
+            visual_artifacts=visual_artifacts,
+        )
         yield AgentEvent(kind="fallback", title="Max iterations", detail=fallback, final_response=response)
 
     def _initial_messages(
@@ -260,6 +278,7 @@ class LlmReActRunner(AgentRunner):
         tool_call: dict[str, Any],
         checkpoint: dict[str, Any],
         reasoning: list[ReasoningStep],
+        visual_artifacts: list[ChartArtifact],
     ) -> str:
         name = tool_call.get("name", "")
         args = tool_call.get("args") or {}
@@ -288,6 +307,9 @@ class LlmReActRunner(AgentRunner):
             latency_ms=int((time.perf_counter() - start) * 1000),
         )
         self._update_checkpoint(name, args, result, checkpoint)
+        artifact = _visual_artifact_from_result(name, result)
+        if artifact:
+            visual_artifacts.append(artifact)
         payload = result.model_dump(mode="json")
         observation = json.dumps(payload, ensure_ascii=False)
         reasoning.append(ReasoningStep(kind="observation", title="Observation", detail=_summarize_result(payload)))
@@ -472,6 +494,9 @@ def _format_examples(rows: list[Any], offset: int, next_offset: int | None) -> s
 
 
 def _summarize_result(payload: dict[str, Any]) -> str:
+    if "artifact" in payload:
+        artifact = payload["artifact"]
+        return f"chart={artifact.get('title')}, rows={len(artifact.get('rows', []))}"
     if "count" in payload:
         return f"count={payload['count']}, filters={payload.get('filters')}"
     if "total_matches" in payload and "rows" in payload:
@@ -485,6 +510,19 @@ def _summarize_result(payload: dict[str, Any]) -> str:
     if "intents" in payload:
         return f"intents={payload['intents'][:12]}"
     return _shorten(json.dumps(payload, ensure_ascii=False))
+
+
+def _visual_artifact_from_result(name: str, result: Any) -> ChartArtifact | None:
+    if hasattr(result, "artifact"):
+        return result.artifact
+    if name == "category_distribution" and hasattr(result, "distribution"):
+        return ChartArtifact(
+            title="Rows by category",
+            x="category",
+            y="count",
+            rows=result.distribution,
+        )
+    return None
 
 
 def _shorten(value: str, limit: int = 240) -> str:

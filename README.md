@@ -50,6 +50,7 @@ Try:
 - `What about refunds?`
 - `What is the total count of the last two?`
 - `Show me 3 examples from the REFUND category`
+- `Show a bar chart of the category breakdown.`
 - `Show me 3 more`
 - `Summarize how agents respond to complaint intents.`
 - `What should I query next?`
@@ -83,7 +84,7 @@ Start the FastMCP server:
 uv run fastmcp run src/bitext_agent/mcp_server.py:mcp
 ```
 
-Exposed tools include `list_categories`, `count_rows`, `show_examples`, and `intent_distribution`.
+Exposed tools include `list_categories`, `count_rows`, `category_distribution`, `show_examples`, and `intent_distribution`.
 
 Call a tool from a Python client:
 
@@ -108,7 +109,7 @@ asyncio.run(main())
 uv run streamlit run src/bitext_agent/streamlit_app.py
 ```
 
-The UI provides chat, session selection, reasoning traces, query recommendations, profile memory controls, dataset diagnostics, and usage/tool-call stats.
+The UI provides chat, inline dataset charts, visual quick actions, session selection, reasoning traces, query recommendations, profile memory controls, dataset diagnostics, and usage/tool-call stats.
 
 Recommendation buttons in Streamlit are convenience shortcuts and run immediately when clicked. The assignment-style recommendation branch is available in both CLI and Streamlit chat: type `What should I query next?`, refine the suggestion in conversation if needed, and confirm before the agent executes it.
 
@@ -164,7 +165,7 @@ flowchart TD
 - Out-of-scope requests are declined without using the LLM's general knowledge.
 - The ReAct runner uses bounded tool calls, prints route/tool/observation reasoning in the CLI and UI, and returns a graceful fallback at `MAX_AGENT_ITERATIONS`.
 - SQLite persists LangGraph checkpoints, conversation turns, and distilled user profile facts. The profile stores facts such as names, topic interests, and answer preferences, not a replay of past messages.
-- FastMCP exposes deterministic dataset tools backed by Polars and DuckDB. Tools are defined with clear names, descriptions, Pydantic argument schemas, and typed result schemas.
+- FastMCP exposes deterministic dataset tools backed by Polars and DuckDB. Tools are defined with clear names, descriptions, Pydantic argument schemas, and typed result schemas. Chart tools return structured rows and chart metadata that Streamlit renders inline.
 - The recommendation route is separate from dataset answering: it suggests a query from conversation history and profile memory, stores it as pending, uses a small LLM refinement prompt for requested changes, and executes only after confirmation.
 
 ## Tests
