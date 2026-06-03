@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import streamlit as st
 
 from bitext_agent.graph import AgentService
-from bitext_agent.schemas import AgentEvent, AgentResponse, RouteKind
+from bitext_agent.schemas import AgentEvent, AgentResponse, ChartArtifact, RouteKind
 
 
 IDLE_RECOMMENDATION_DELAY = timedelta(minutes=2)
@@ -38,6 +38,8 @@ def main() -> None:
         st.session_state["session_id"] = "demo"
     st.session_state.setdefault("last_user_activity_at", datetime.now(UTC))
     st.session_state.setdefault("request_running", False)
+    if st.session_state["request_running"] and "request_started_at" not in st.session_state:
+        st.session_state["request_running"] = False
     st.session_state.setdefault("stop_requested", False)
     st.session_state.setdefault("idle_recommendations_visible", False)
     _idle_tick()
@@ -56,7 +58,10 @@ def main() -> None:
                     f"Saved {len(saved)} profile fact(s) from the previous chat."
                 )
             st.session_state["session_id"] = new_session_id()
+            st.session_state["request_running"] = False
+            st.session_state["stop_requested"] = False
             st.session_state["idle_recommendations_visible"] = False
+            st.session_state.pop("active_message_key", None)
             st.rerun()
         if notice := st.session_state.pop("memory_notice", None):
             st.success(notice)
@@ -117,11 +122,7 @@ def main() -> None:
         else:
             response = item["response"]
             with st.chat_message("assistant"):
-                st.write(response.answer)
-                if response.reasoning:
-                    with st.expander("Reasoning"):
-                        for step in response.reasoning:
-                            st.markdown(f"**{step.title}**: {step.detail}")
+                _render_agent_response(response)
 
     recommendation_label = "Recommended queries" if st.session_state[key] else "Starter queries"
     if _idle_ready(key):
@@ -165,6 +166,7 @@ def _load_session_messages(
                         route=route,
                         reasoning=[],
                         suggested_query=metadata.get("suggested_query"),
+                        visual_artifacts=_load_visual_artifacts(metadata.get("visual_artifacts")),
                     ),
                 }
             )
@@ -181,7 +183,7 @@ def _render_recommendations(
     service: AgentService, session_id: str, user_id: str, message_key: str, label: str
 ) -> None:
     if hasattr(service, "recommendation_slots"):
-        slots = service.recommendation_slots(session_id, user_id, limit=2)
+        slots = service.recommendation_slots(session_id, user_id, limit=3)
     else:
         st.cache_resource.clear()
         st.rerun()
@@ -200,7 +202,7 @@ def _render_recommendations(
         if cols[index].button(query, key=f"recommendation:{message_key}:{slot_index}:{query}"):
             _select_recommendation(service, session_id, query)
             _run_prompt(service, query, session_id, user_id, message_key)
-            service.replace_recommendation_slot(session_id, user_id, slot_index, limit=2)
+            service.replace_recommendation_slot(session_id, user_id, slot_index, limit=3)
             st.rerun()
 
 
@@ -226,15 +228,19 @@ def _run_prompt(
     st.session_state["last_user_activity_at"] = datetime.now(UTC)
     st.session_state["idle_recommendations_visible"] = False
     st.session_state["request_running"] = True
+    st.session_state["request_started_at"] = datetime.now(UTC)
     st.session_state["stop_requested"] = False
-    st.session_state[message_key].append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
-    with st.chat_message("assistant"):
-        response = _render_streaming_response(service, prompt, session_id, user_id)
-    st.session_state[message_key].append({"role": "assistant", "response": response})
-    st.session_state["request_running"] = False
-    st.session_state["stop_requested"] = False
+    try:
+        st.session_state[message_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        with st.chat_message("assistant"):
+            response = _render_streaming_response(service, prompt, session_id, user_id)
+        st.session_state[message_key].append({"role": "assistant", "response": response})
+    finally:
+        st.session_state["request_running"] = False
+        st.session_state["stop_requested"] = False
+        st.session_state.pop("request_started_at", None)
 
 
 def _render_streaming_response(
@@ -261,17 +267,66 @@ def _render_streaming_response(
             reasoning=[],
         )
         answer_box.write(final_response.answer)
+    _render_visual_artifacts(final_response.visual_artifacts)
     return final_response
+
+
+def _render_agent_response(response: AgentResponse) -> None:
+    st.write(response.answer)
+    _render_visual_artifacts(response.visual_artifacts)
+    if response.reasoning:
+        with st.expander("Reasoning"):
+            for step in response.reasoning:
+                st.markdown(f"**{_reasoning_label(step.kind, step.title)}**: {step.detail}")
+
+
+def _render_visual_artifacts(artifacts: list[ChartArtifact]) -> None:
+    for artifact in artifacts:
+        rows = _chart_rows(artifact)
+        if not rows:
+            continue
+        st.caption(artifact.title)
+        st.bar_chart(rows, x=artifact.x, y=artifact.y)
+
+
+def _chart_rows(artifact: ChartArtifact) -> list[dict[str, int | str]]:
+    return [row for row in artifact.rows if artifact.x in row and artifact.y in row]
+
+
+def _load_visual_artifacts(value: object) -> list[ChartArtifact]:
+    if not isinstance(value, list):
+        return []
+    artifacts: list[ChartArtifact] = []
+    for item in value:
+        if isinstance(item, dict):
+            artifacts.append(ChartArtifact.model_validate(item))
+    return artifacts
 
 
 def _live_reasoning_status(events: list[AgentEvent]) -> str:
     for event in reversed(_dedupe_events(events)):
         if event.kind == "final":
             continue
+        label = _reasoning_label(event.kind, event.title)
         if event.detail:
-            return f"Reasoning: {event.title} - {_shorten(event.detail)}"
-        return f"Reasoning: {event.title}"
+            return f"Reasoning: {label} - {_shorten(event.detail)}"
+        return f"Reasoning: {label}"
     return ""
+
+
+def _reasoning_label(kind: str, title: str) -> str:
+    icons = {
+        "route": "🧭",
+        "tool": "🛠️",
+        "observation": "👁️",
+        "final": "✅",
+        "fallback": "⚠️",
+        "memory": "🧠",
+        "recommendation": "💡",
+        "cancelled": "⏹️",
+        "error": "⚠️",
+    }
+    return f"{icons.get(kind, '•')} {title}"
 
 
 def _shorten(value: str, limit: int = 160) -> str:
